@@ -61,6 +61,32 @@ var server = http.createServer(function(req, res) {
     res.writeHead(200); res.end('WatchParty AI Running!'); return;
   }
 
+  // Check available leagues on free tier
+  if (req.method === 'GET' && req.url === '/leagues') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    footballAPI('/leagues?current=true').then(function(result) {
+      if (result && result.response) {
+        var leagues = result.response.slice(0, 20).map(function(l) {
+          return { id: l.league.id, name: l.league.name, country: l.country.name, season: l.seasons && l.seasons[0] && l.seasons[0].year };
+        });
+        res.end(JSON.stringify({ count: result.response.length, leagues: leagues }));
+      } else { res.end(JSON.stringify({ error: 'Cannot fetch leagues', result: result })); }
+    }); return;
+  }
+
+  // Search fixtures by league id
+  if (req.method === 'GET' && req.url.startsWith('/fixtures/')) {
+    var leagueId = req.url.split('/')[2];
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    footballAPI('/fixtures?league=' + leagueId + '&season=2025&next=5').then(function(result) {
+      var matches = (result && result.response || []).map(function(m) {
+        var date = new Date(m.fixture.date);
+        return { fixture_id: m.fixture.id, home: m.teams.home.name, away: m.teams.away.name, date: date.toLocaleDateString('en-KE', { timeZone: 'Africa/Nairobi' }), time: date.toLocaleTimeString('en-KE', { timeZone: 'Africa/Nairobi', hour: '2-digit', minute: '2-digit' }) };
+      });
+      res.end(JSON.stringify({ league_id: leagueId, fixtures: matches, count: matches.length }));
+    }); return;
+  }
+
   if (req.method === 'GET' && req.url === '/test') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     footballAPI('/status').then(function(result) {
