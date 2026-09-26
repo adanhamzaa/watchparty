@@ -89,49 +89,69 @@ function generateCommentary(event, matchInfo, language) {
   });
 }
 
-// Google TTS - FREE
+// Azure TTS - FREE 500k chars/month
 function textToSpeech(text, language) {
   return new Promise(function(resolve) {
-    var langCode = { 'sheng': 'sw-KE', 'swahili': 'sw-KE', 'somali': 'so-SO', 'english': 'en-KE' };
-    var voiceName = { 'sheng': 'sw-KE-Standard-A', 'swahili': 'sw-KE-Standard-A', 'somali': 'en-US-Standard-D', 'english': 'en-US-Standard-D' };
+    var AZURE_KEY = process.env.AZURE_SPEECH_KEY || '';
+    var AZURE_REGION = process.env.AZURE_SPEECH_REGION || 'eastus';
+    if (!AZURE_KEY) { resolve(null); return; }
 
-    // Clean text for TTS
-    var cleanText = text.replace(/[🔥⚽🎙️😂💥🚀🔴⚪👑💰]/g, '').replace(/\*\*/g, '').replace(/#\w+/g, '').trim();
+    // Voice selection per language
+    var voiceName = {
+      'sheng': 'sw-KE-ZuriNeural',
+      'swahili': 'sw-KE-ZuriNeural',
+      'somali': 'en-US-AriaNeural',
+      'english': 'en-US-AriaNeural'
+    };
 
-    var body = JSON.stringify({
-      input: { text: cleanText },
-      voice: { languageCode: langCode[language] || 'sw-KE', name: voiceName[language] || 'sw-KE-Standard-A' },
-      audioConfig: { audioEncoding: 'MP3', speakingRate: 1.2, pitch: 2.0 }
-    });
+    // Clean text for TTS - remove emojis and markdown
+    var cleanText = text
+      .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')
+      .replace(/\*\*/g, '')
+      .replace(/#\w+/g, '')
+      .replace(/[🔥⚽🎙️😂💥🚀🔴⚪👑💰🎯🙌]/g, '')
+      .trim();
+
+    if (!cleanText || cleanText.length < 5) { resolve(null); return; }
+
+    // Azure SSML
+    var ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="sw-KE">';
+    ssml += '<voice name="' + (voiceName[language] || 'sw-KE-ZuriNeural') + '">';
+    ssml += '<prosody rate="1.2" pitch="+5%">';
+    ssml += cleanText;
+    ssml += '</prosody></voice></speak>';
 
     var options = {
-      hostname: 'texttospeech.googleapis.com',
-      path: '/v1/text:synthesize?key=' + (process.env.GOOGLE_TTS_KEY || ''),
+      hostname: AZURE_REGION + '.tts.speech.microsoft.com',
+      path: '/cognitiveservices/v1',
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      headers: {
+        'Ocp-Apim-Subscription-Key': AZURE_KEY,
+        'Content-Type': 'application/ssml+xml',
+        'X-Microsoft-OutputFormat': 'audio-16khz-128kbitrate-mono-mp3',
+        'Content-Length': Buffer.byteLength(ssml)
+      }
     };
 
     var req = https.request(options, function(res) {
-      var data = '';
-      res.on('data', function(chunk) { data += chunk; });
+      var chunks = [];
+      res.on('data', function(chunk) { chunks.push(chunk); });
       res.on('end', function() {
-        try {
-          var result = JSON.parse(data);
-          if (result.audioContent) {
-            var audioBuffer = Buffer.from(result.audioContent, 'base64');
-            var filename = '/tmp/watchparty_' + Date.now() + '.mp3';
-            fs.writeFileSync(filename, audioBuffer);
-            resolve(filename);
-          } else {
-            console.log('TTS error:', JSON.stringify(result).substring(0, 200));
-            resolve(null);
-          }
-        } catch(e) { resolve(null); }
+        if (res.statusCode === 200) {
+          var audioBuffer = Buffer.concat(chunks);
+          var filename = '/tmp/watchparty_' + Date.now() + '.mp3';
+          fs.writeFileSync(filename, audioBuffer);
+          console.log('Azure TTS success! File:', filename, 'Size:', audioBuffer.length);
+          resolve(filename);
+        } else {
+          console.log('Azure TTS error:', res.statusCode, Buffer.concat(chunks).toString().substring(0, 200));
+          resolve(null);
+        }
       });
     });
-    req.on('error', function(e) { console.log('TTS request error:', e.message); resolve(null); });
+    req.on('error', function(e) { console.log('Azure TTS error:', e.message); resolve(null); });
     setTimeout(function() { req.destroy(); resolve(null); }, 15000);
-    req.write(body);
+    req.write(ssml);
     req.end();
   });
 }
@@ -223,14 +243,14 @@ async function processEvent(event, matchInfo, conversationId, language) {
     await sendMessage(conversationId, textMsg);
 
     // Try to generate and send voice note if Google TTS key available
-    if (process.env.GOOGLE_TTS_KEY) {
+    if (process.env.AZURE_SPEECH_KEY) {
       var audioFile = await textToSpeech(commentary, language);
       if (audioFile) {
         await sendAudioMessage(conversationId, audioFile);
         console.log('Voice note sent!');
       }
     } else {
-      console.log('No Google TTS key — text only mode');
+      console.log('No Azure TTS key — text only mode');
     }
 
   } catch(e) { console.log('Process event error:', e.message); }
