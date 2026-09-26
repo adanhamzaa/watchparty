@@ -290,7 +290,7 @@ var server = http.createServer(async function(req, res) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     footballAPI('/status').then(function(result) {
       if (result && result.response) {
-        res.end(JSON.stringify({ success: true, requests_today: result.response.requests.current, remaining: result.response.requests.limit_day - result.response.requests.current, voice_enabled: !!process.env.GOOGLE_TTS_KEY }));
+        res.end(JSON.stringify({ success: true, requests_today: result.response.requests.current, remaining: result.response.requests.limit_day - result.response.requests.current, voice_enabled: !!process.env.AZURE_SPEECH_KEY }));
       } else { res.end(JSON.stringify({ success: false })); }
     }); return;
   }
@@ -315,11 +315,11 @@ var server = http.createServer(async function(req, res) {
     output += 'Match: Arsenal vs Man City\n';
     output += 'Event: GOAL by Saka - Minute 23\n\n';
     output += commentary + '\n\n';
-    if (process.env.GOOGLE_TTS_KEY) {
+    if (process.env.AZURE_SPEECH_KEY) {
       var audioFile = await textToSpeech(commentary, lang);
       output += audioFile ? 'Voice note generated: ' + audioFile : 'Voice note failed!';
     } else {
-      output += 'Voice note: Add GOOGLE_TTS_KEY to enable voice!\nGet free key at: console.cloud.google.com';
+      output += 'Voice note: Add AZURE_SPEECH_KEY to Railway variables!';
     }
     res.end(output); return;
   }
@@ -384,9 +384,9 @@ var server = http.createServer(async function(req, res) {
     }
 
     // Send confirmation
-    await sendMessage(convId, 'WatchParty AI activated! \n\nMatch: ' + mInfo + '\nLanguage: ' + subLang.toUpperCase() + '\n\nYou will receive ' + (process.env.GOOGLE_TTS_KEY ? 'voice notes' : 'text alerts') + ' for goals, cards and substitutions!\n\nReply with team name or "stop" to unsubscribe.');
+    await sendMessage(convId, 'WatchParty AI activated! \n\nMatch: ' + mInfo + '\nLanguage: ' + subLang.toUpperCase() + '\n\nYou will receive ' + (process.env.AZURE_SPEECH_KEY ? 'voice notes' : 'text alerts') + ' for goals, cards and substitutions!\n\nReply with team name or "stop" to unsubscribe.');
 
-    res.end(JSON.stringify({ success: true, message: 'Subscribed to ' + mInfo, language: subLang, voice: !!process.env.GOOGLE_TTS_KEY }));
+    res.end(JSON.stringify({ success: true, message: 'Subscribed to ' + mInfo, language: subLang, voice: !!process.env.AZURE_SPEECH_KEY }));
     return;
   }
 
