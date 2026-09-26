@@ -1,0 +1,10 @@
+{
+  "name": "watchparty-ai",
+  "version": "1.0.0",
+  "description": "WatchParty AI - Sheng Football Commentary",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
