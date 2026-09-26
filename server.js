@@ -98,8 +98,8 @@ function textToSpeech(text, language) {
 
     // Voice selection per language
     var voiceName = {
-      'sheng': 'sw-KE-ZuriNeural',
-      'swahili': 'sw-KE-ZuriNeural',
+      'sheng': 'en-US-AriaNeural',
+      'swahili': 'en-US-AriaNeural',
       'somali': 'en-US-AriaNeural',
       'english': 'en-US-AriaNeural'
     };
@@ -115,7 +115,7 @@ function textToSpeech(text, language) {
     if (!cleanText || cleanText.length < 5) { resolve(null); return; }
 
     // Azure SSML
-    var ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="sw-KE">';
+    var ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">';
     ssml += '<voice name="' + (voiceName[language] || 'sw-KE-ZuriNeural') + '">';
     ssml += '<prosody rate="1.2" pitch="+5%">';
     ssml += cleanText;
