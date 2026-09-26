@@ -396,6 +396,6 @@ var server = http.createServer(async function(req, res) {
 
 server.listen(PORT, function() {
   console.log('WatchParty AI starting on port ' + PORT);
-  console.log('Voice enabled:', !!process.env.GOOGLE_TTS_KEY);
+  console.log('Voice enabled:', !!process.env.AZURE_SPEECH_KEY);
   console.log('WatchParty AI Ready!');
 });
