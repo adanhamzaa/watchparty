@@ -178,44 +178,48 @@ function sendMessage(conversationId, text) {
   });
 }
 
-// Send audio as attachment via Chatwoot
+// Store audio files in memory for serving
+var audioFiles = {};
+
+// Send audio via public URL link
 function sendAudioMessage(conversationId, audioFilePath) {
   return new Promise(function(resolve) {
     if (!fs.existsSync(audioFilePath)) { resolve(false); return; }
+    
+    // Store file and create public ID
+    var audioId = 'audio_' + Date.now();
     var audioData = fs.readFileSync(audioFilePath);
-    var boundary = 'boundary' + Date.now();
-    var header = '--' + boundary + '\r\nContent-Disposition: form-data; name="attachments[]"; filename="commentary.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n';
-    var footer = '\r\n--' + boundary + '--\r\n';
-    var typeField = '--' + boundary + '\r\nContent-Disposition: form-data; name="message_type"\r\n\r\noutgoing\r\n';
-    var body = Buffer.concat([
-      Buffer.from(typeField),
-      Buffer.from(header),
-      audioData,
-      Buffer.from(footer)
-    ]);
-
+    audioFiles[audioId] = { data: audioData, created: Date.now() };
+    
+    // Clean old files older than 10 minutes
+    var now = Date.now();
+    Object.keys(audioFiles).forEach(function(id) {
+      if (now - audioFiles[id].created > 600000) delete audioFiles[id];
+    });
+    
+    var RAILWAY_URL = process.env.RAILWAY_PUBLIC_DOMAIN || 'watchparty-production-d9f0.up.railway.app';
+    var audioUrl = 'https://' + RAILWAY_URL + '/audio/' + audioId;
+    
+    // Send as text link
+    var linkMsg = '🎙️ Sheng Commentary Voice Note:\n' + audioUrl + '\n\nTap the link to hear it!';
+    
+    var body = JSON.stringify({ content: linkMsg, message_type: 'outgoing', private: false });
     var options = {
       hostname: CHATWOOT_URL,
       path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages',
       method: 'POST',
-      headers: {
-        'api_access_token': CHATWOOT_TOKEN,
-        'Content-Type': 'multipart/form-data; boundary=' + boundary,
-        'Content-Length': body.length
-      }
+      headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'application/json', 'content-length': Buffer.byteLength(body) }
     };
-
     var req = https.request(options, function(res) {
       var data = '';
       res.on('data', function(chunk) { data += chunk; });
       res.on('end', function() {
-        console.log('Audio send response:', data.substring(0, 200));
-        // Clean up temp file
+        console.log('Audio link sent!');
         try { fs.unlinkSync(audioFilePath); } catch(e) {}
         resolve(true);
       });
     });
-    req.on('error', function(e) { console.log('Audio send error:', e.message); resolve(false); });
+    req.on('error', function(e) { console.log('Audio link error:', e.message); resolve(false); });
     req.write(body);
     req.end();
   });
@@ -260,12 +264,28 @@ async function processEvent(event, matchInfo, conversationId, language) {
 // Poll match for new events
 async function pollMatch(fixtureId, matchInfo, subscribers) {
   try {
+    // Check if match is still LIVE first
+    var fixtureCheck = await footballAPI('/fixtures?id=' + fixtureId);
+    if (fixtureCheck && fixtureCheck.response && fixtureCheck.response[0]) {
+      var status = fixtureCheck.response[0].fixture.status.short;
+      if (!['1H', '2H', 'ET', 'P', 'HT'].includes(status)) {
+        console.log('Match', fixtureId, 'finished (status:', status, ') - stopping polling');
+        if (matchPolling[fixtureId]) { clearInterval(matchPolling[fixtureId]); delete matchPolling[fixtureId]; }
+        return;
+      }
+    }
+
+    // Time check - only send 6AM-11PM Nairobi
+    var now = new Date();
+    var nairobi = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+    var hour = nairobi.getHours();
+    if (hour < 6 || hour >= 23) { console.log('Outside hours:', hour); return; }
+
     var result = await footballAPI('/fixtures/events?fixture=' + fixtureId);
     if (!result || !result.response) return;
 
     var events = result.response;
 
-    // Check each subscriber for new events
     for (var convId in subscribers) {
       var sub = subscribers[convId];
       if (sub.fixtureId !== fixtureId) continue;
@@ -274,7 +294,13 @@ async function pollMatch(fixtureId, matchInfo, subscribers) {
       var newEvents = events.slice(lastIndex);
 
       for (var i = 0; i < newEvents.length; i++) {
-        await processEvent(newEvents[i], matchInfo, convId, sub.language || 'sheng');
+        var evt = newEvents[i];
+        // Only goals and red cards
+        if (evt.type === 'Goal') {
+          await processEvent(evt, matchInfo, convId, sub.language || 'sheng');
+        } else if (evt.type === 'Card' && evt.detail === 'Red Card') {
+          await processEvent(evt, matchInfo, convId, sub.language || 'sheng');
+        }
         sub.lastEventIndex = lastIndex + i + 1;
       }
     }
@@ -285,6 +311,18 @@ var server = http.createServer(async function(req, res) {
 
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200); res.end('WatchParty AI Running! Subscriptions: ' + Object.keys(subscriptions).length); return;
+  }
+
+  // Serve audio files
+  if (req.method === 'GET' && req.url.startsWith('/audio/')) {
+    var audioId = req.url.replace('/audio/', '');
+    if (audioFiles[audioId]) {
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': audioFiles[audioId].data.length });
+      res.end(audioFiles[audioId].data);
+    } else {
+      res.writeHead(404); res.end('Audio not found');
+    }
+    return;
   }
 
   if (req.method === 'GET' && req.url === '/test') {
