@@ -1,32 +1,36 @@
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
-const path = require('path');
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
-const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
-const CHATWOOT_URL = process.env.CHATWOOT_URL || 'chatwoot-production-5bb4.up.railway.app';
-const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
+const HIGHLIGHTLY_KEY = process.env.HIGHLIGHTLY_API_KEY;
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const AZURE_KEY = process.env.AZURE_SPEECH_KEY;
+const AZURE_REGION = process.env.AZURE_SPEECH_REGION || 'eastus';
 const PORT = process.env.PORT || 3000;
 
-// Store active subscriptions and match state
-var subscriptions = {}; // { conversationId: { team: 'Arsenal', fixtureId: 123, language: 'sheng', lastEventId: null } }
-var matchPolling = {}; // { fixtureId: intervalId }
+// Subscriber database
+// { chatId: { teams: ['Arsenal'], language: 'sheng', active: true } }
+var subscribers = {};
+var matchPolling = {};
+var lastEventIndex = {};
+var commentaryHistory = {}; // { fixtureId: ['commentary1', 'commentary2'] }
+var videoFileIds = {}; // { videoUrl: telegramFileId } — reuse uploaded videos!
 
-// Football API call
-function footballAPI(path) {
+// ============= HIGHLIGHTLY API =============
+function highlightlyAPI(path) {
   return new Promise(function(resolve) {
     var options = {
-      hostname: 'v3.football.api-sports.io',
+      hostname: 'soccer.highlightly.net',
       path: path,
       method: 'GET',
-      headers: { 'x-apisports-key': FOOTBALL_API_KEY }
+      headers: { 'x-api-key': HIGHLIGHTLY_KEY }
     };
     var req = https.request(options, function(res) {
-      var data = '';
-      res.on('data', function(chunk) { data += chunk; });
+      var d = '';
+      res.on('data', function(c) { d += c; });
       res.on('end', function() {
-        try { resolve(JSON.parse(data)); }
+        try { resolve(JSON.parse(d)); }
         catch(e) { resolve(null); }
       });
     });
@@ -36,403 +40,394 @@ function footballAPI(path) {
   });
 }
 
-// Generate commentary using Claude
-function generateCommentary(event, matchInfo, language) {
+// ============= TELEGRAM API =============
+function telegramAPI(method, data) {
+  return new Promise(function(resolve) {
+    var body = JSON.stringify(data);
+    var options = {
+      hostname: 'api.telegram.org',
+      path: '/bot' + TELEGRAM_TOKEN + '/' + method,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    };
+    var req = https.request(options, function(res) {
+      var d = '';
+      res.on('data', function(c) { d += c; });
+      res.on('end', function() {
+        try { resolve(JSON.parse(d)); }
+        catch(e) { resolve(null); }
+      });
+    });
+    req.on('error', function() { resolve(null); });
+    req.write(body); req.end();
+  });
+}
+
+function sendText(chatId, text) {
+  return telegramAPI('sendMessage', { chat_id: chatId, text: text, parse_mode: 'HTML' });
+}
+
+function sendVoiceBuffer(chatId, audioBuffer) {
+  return new Promise(function(resolve) {
+    var boundary = 'boundary' + Date.now();
+    var chatField = '--' + boundary + '\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n' + chatId + '\r\n';
+    var header = '--' + boundary + '\r\nContent-Disposition: form-data; name="voice"; filename="commentary.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n';
+    var footer = '\r\n--' + boundary + '--\r\n';
+    var body = Buffer.concat([Buffer.from(chatField), Buffer.from(header), audioBuffer, Buffer.from(footer)]);
+    var options = {
+      hostname: 'api.telegram.org',
+      path: '/bot' + TELEGRAM_TOKEN + '/sendVoice',
+      method: 'POST',
+      headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length }
+    };
+    var req = https.request(options, function(res) {
+      var d = '';
+      res.on('data', function(c) { d += c; });
+      res.on('end', function() {
+        try { resolve(JSON.parse(d)); }
+        catch(e) { resolve(null); }
+      });
+    });
+    req.on('error', function() { resolve(null); });
+    req.write(body); req.end();
+  });
+}
+
+function sendVideoUrl(chatId, videoUrl, caption) {
+  return telegramAPI('sendVideo', { chat_id: chatId, video: videoUrl, caption: caption || '' });
+}
+
+// ============= CLAUDE AI COMMENTARY =============
+function generateCommentary(event, matchInfo, language, fixtureId) {
   return new Promise(function(resolve) {
     var personalities = ['Shocked and excited', 'Sarcastic banter', 'Calm analysis', 'Dramatic over-reaction', 'Funny rivalry teasing'];
     var personality = personalities[Math.floor(Math.random() * personalities.length)];
 
-    langStyle = {
-      'sheng': 'Write EXACTLY as a young Nairobi man SPEAKING to friends watching football. Natural Sheng — not forced slang list. Short punchy sentences. Style: ' + personality + '. Under 50 words!',
-      'swahili': 'Andika kama shabiki wa Nairobi anayeongea na marafiki. Kiswahili cha mtaani. Fupi na yenye nguvu. Style: ' + personality + '. Maneno chini ya 50!',
-      'somali': 'Qor sida taageere Soomaali ah oo la hadlaya saaxiibbadiis. Gaaban oo kulul. Style: ' + personality + '. Waa ka yar 50 ereyood!',
-      'english': 'Write as excited East African fan talking to friends. Casual natural English with local flavor. Style: ' + personality + '. Under 50 words!'
+    var langPrompts = {
+      'sheng': 'Write EXACTLY as a young Nairobi man SPEAKING to friends watching football. Natural Sheng flow — not a forced slang list. Short punchy sentences. Style: ' + personality,
+      'swahili': 'Andika kama shabiki wa Nairobi anayeongea na marafiki. Kiswahili cha mtaani. Fupi na yenye nguvu. Style: ' + personality,
+      'somali': 'Qor sida taageere Soomaali ah oo la hadlaya saaxiibbadiis. Gaaban oo kulul. Style: ' + personality,
+      'english': 'Write as excited East African fan talking to friends. Casual natural English with local flavor. Style: ' + personality
     };
 
     var eventDesc = '';
-    if (event.type === 'Goal') eventDesc = 'GOAL scored by ' + (event.player && event.player.name) + ' for ' + (event.team && event.team.name) + (event.assist && event.assist.name ? ', assisted by ' + event.assist.name : '') + ' at minute ' + event.time.elapsed;
-    else if (event.type === 'Card') eventDesc = (event.detail || 'Card') + ' for ' + (event.player && event.player.name) + ' (' + (event.team && event.team.name) + ') at minute ' + event.time.elapsed;
-    else if (event.type === 'subst') eventDesc = 'Substitution: ' + (event.assist && event.assist.name) + ' replaces ' + (event.player && event.player.name) + ' at minute ' + event.time.elapsed;
-    else eventDesc = event.type + ' at minute ' + event.time.elapsed;
+    if (event.type === 'Goal') eventDesc = 'GOAL! ' + (event.player || 'Player') + ' scored for ' + (event.team || 'team') + ' at minute ' + (event.time || '?');
+    else if (event.type === 'Card') eventDesc = 'RED CARD! ' + (event.player || 'Player') + ' (' + (event.team || 'team') + ') at minute ' + (event.time || '?');
+    else eventDesc = event.type + ' at minute ' + (event.time || '?');
 
-    var prompt = 'You are WatchParty AI — a passionate football commentator for East African fans.\n\nMatch: ' + matchInfo + '\nEvent: ' + eventDesc + '\n\nLanguage: ' + (langStyle[language] || langStyle['sheng']) + '\n\nGenerate EXCITING commentary. Use emojis! NO hashtags. Keep it short and punchy!';
+    var history = commentaryHistory[fixtureId] || [];
+    var historyText = history.length > 0 ? ' Previous commentary (do not repeat): ' + history.slice(-3).join(' | ') : '';
 
-    var body = JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 150,
-      messages: [{ role: 'user', content: prompt }]
-    });
+    var prompt = 'Football: ' + matchInfo + '. Event: ' + eventDesc + historyText + '. ' + (langPrompts[language] || langPrompts['sheng']) + '. Under 60 words. Emojis! No hashtags!';
 
+    var body = JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 150, messages: [{ role: 'user', content: prompt }] });
     var options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body)
-      }
+      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+      headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }
     };
-
     var req = https.request(options, function(res) {
-      var data = '';
-      res.on('data', function(chunk) { data += chunk; });
+      var d = '';
+      res.on('data', function(c) { d += c; });
       res.on('end', function() {
         try {
-          var result = JSON.parse(data);
-          resolve(result.content && result.content[0] ? result.content[0].text : '');
+          var r = JSON.parse(d);
+          var text = r.content && r.content[0] ? r.content[0].text : '';
+          if (text && fixtureId) {
+            if (!commentaryHistory[fixtureId]) commentaryHistory[fixtureId] = [];
+            commentaryHistory[fixtureId].push(text.substring(0, 80));
+            if (commentaryHistory[fixtureId].length > 10) commentaryHistory[fixtureId].shift();
+          }
+          resolve(text);
         } catch(e) { resolve(''); }
       });
     });
     req.on('error', function() { resolve(''); });
     setTimeout(function() { req.destroy(); resolve(''); }, 15000);
-    req.write(body);
-    req.end();
+    req.write(body); req.end();
   });
 }
 
-// Azure TTS - FREE 500k chars/month
-function textToSpeech(text, language) {
+// ============= SPOKEN SCRIPT FOR TTS =============
+function generateSpokenScript(commentary, language) {
   return new Promise(function(resolve) {
-    var AZURE_KEY = process.env.AZURE_SPEECH_KEY || '';
-    var AZURE_REGION = process.env.AZURE_SPEECH_REGION || 'eastus';
-    if (!AZURE_KEY) { resolve(null); return; }
-
-    // Voice selection per language
-    var voiceName = {
-      'sheng': 'sw-KE-RafikiNeural',
-      'swahili': 'sw-KE-RafikiNeural',
-      'somali': 'sw-KE-RafikiNeural',
-      'english': 'en-US-AriaNeural'
+    var prompt = 'Convert this football commentary to natural SPOKEN text for text-to-speech. Remove emojis. Keep energy. Short punchy sentences for ' + language + '. Return ONLY spoken text: ' + commentary;
+    var body = JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 100, messages: [{ role: 'user', content: prompt }] });
+    var options = {
+      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+      headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }
     };
+    var req = https.request(options, function(res) {
+      var d = '';
+      res.on('data', function(c) { d += c; });
+      res.on('end', function() {
+        try { var r = JSON.parse(d); resolve(r.content && r.content[0] ? r.content[0].text : commentary); }
+        catch(e) { resolve(commentary); }
+      });
+    });
+    req.on('error', function() { resolve(commentary); });
+    setTimeout(function() { req.destroy(); resolve(commentary); }, 10000);
+    req.write(body); req.end();
+  });
+}
 
-    // Clean text for TTS - remove emojis and markdown
-    var cleanText = text
-      .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')
-      .replace(/\*\*/g, '')
-      .replace(/#\w+/g, '')
-      .replace(/[🔥⚽🎙️😂💥🚀🔴⚪👑💰🎯🙌]/g, '')
-      .trim();
-
+// ============= AZURE TTS =============
+function textToVoice(text, language) {
+  return new Promise(function(resolve) {
+    if (!AZURE_KEY) { resolve(null); return; }
+    var cleanText = text.replace(/[\u{1F300}-\u{1F9FF}]/gu, '').replace(/\*\*/g, '').replace(/#\w+/g, '').replace(/[<>]/g, '').trim();
     if (!cleanText || cleanText.length < 5) { resolve(null); return; }
-
-    // Azure SSML
-    var langCode = language === 'english' ? 'en-US' : 'sw-KE';
-    var ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="' + langCode + '">';
-    ssml += '<voice name="' + (voiceName[language] || 'sw-KE-ZuriNeural') + '">';
-    ssml += '<prosody rate="1.2" pitch="+5%">';
-    ssml += cleanText;
-    ssml += '</prosody></voice></speak>';
-
+    var voice = language === 'english' ? 'en-US-AriaNeural' : 'sw-KE-RafikiNeural';
+    var lang = language === 'english' ? 'en-US' : 'sw-KE';
+    var ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="' + lang + '"><voice name="' + voice + '"><prosody rate="1.2" pitch="+5%">' + cleanText + '</prosody></voice></speak>';
     var options = {
       hostname: AZURE_REGION + '.tts.speech.microsoft.com',
-      path: '/cognitiveservices/v1',
-      method: 'POST',
-      headers: {
-        'Ocp-Apim-Subscription-Key': AZURE_KEY,
-        'Content-Type': 'application/ssml+xml',
-        'X-Microsoft-OutputFormat': 'audio-16khz-128kbitrate-mono-mp3',
-        'User-Agent': 'WatchPartyAI',
-        'Content-Length': Buffer.byteLength(ssml, 'utf8')
-      }
+      path: '/cognitiveservices/v1', method: 'POST',
+      headers: { 'Ocp-Apim-Subscription-Key': AZURE_KEY, 'Content-Type': 'application/ssml+xml', 'X-Microsoft-OutputFormat': 'audio-16khz-128kbitrate-mono-mp3', 'User-Agent': 'WatchPartyAI', 'Content-Length': Buffer.byteLength(ssml) }
     };
-
     var req = https.request(options, function(res) {
       var chunks = [];
-      res.on('data', function(chunk) { chunks.push(chunk); });
+      res.on('data', function(c) { chunks.push(c); });
       res.on('end', function() {
-        if (res.statusCode === 200) {
-          var audioBuffer = Buffer.concat(chunks);
-          var filename = '/tmp/watchparty_' + Date.now() + '.mp3';
-          fs.writeFileSync(filename, audioBuffer);
-          console.log('Azure TTS success! File:', filename, 'Size:', audioBuffer.length);
-          resolve(filename);
-        } else {
-          console.log('Azure TTS error:', res.statusCode, Buffer.concat(chunks).toString().substring(0, 200));
-          resolve(null);
+        if (res.statusCode === 200) { resolve(Buffer.concat(chunks)); }
+        else { console.log('Azure TTS error:', res.statusCode); resolve(null); }
+      });
+    });
+    req.on('error', function() { resolve(null); });
+    setTimeout(function() { req.destroy(); resolve(null); }, 15000);
+    req.write(ssml); req.end();
+  });
+}
+
+// ============= BROADCAST TO ALL SUBSCRIBERS =============
+async function broadcastToSubscribers(event, matchInfo, homeTeam, awayTeam, fixtureId) {
+  var relevantSubs = [];
+  for (var chatId in subscribers) {
+    var sub = subscribers[chatId];
+    if (!sub.active) continue;
+    var shouldNotify = false;
+    if (sub.teams && sub.teams.includes('all')) {
+      shouldNotify = true;
+    } else if (sub.teams) {
+      sub.teams.forEach(function(t) {
+        if (homeTeam.toLowerCase().includes(t.toLowerCase()) || awayTeam.toLowerCase().includes(t.toLowerCase())) {
+          shouldNotify = true;
         }
       });
-    });
-    req.on('error', function(e) { console.log('Azure TTS error:', e.message); resolve(null); });
-    setTimeout(function() { req.destroy(); resolve(null); }, 15000);
-    req.write(ssml);
-    req.end();
+    }
+    if (shouldNotify) relevantSubs.push({ chatId: chatId, language: sub.language || 'sheng' });
+  }
+
+  if (relevantSubs.length === 0) return;
+  console.log('Broadcasting to', relevantSubs.length, 'subscribers for', matchInfo);
+
+  // Group by language — generate ONE commentary per language
+  var languages = {};
+  relevantSubs.forEach(function(s) {
+    if (!languages[s.language]) languages[s.language] = [];
+    languages[s.language].push(s.chatId);
   });
-}
 
-// Send text message via Chatwoot
-function sendMessage(conversationId, text) {
-  return new Promise(function(resolve) {
-    var body = JSON.stringify({ content: text, message_type: 'outgoing', private: false });
-    var options = {
-      hostname: CHATWOOT_URL,
-      path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages',
-      method: 'POST',
-      headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'application/json', 'content-length': Buffer.byteLength(body) }
-    };
-    var req = https.request(options, function(res) {
-      var data = '';
-      res.on('data', function(chunk) { data += chunk; });
-      res.on('end', function() { resolve(true); });
-    });
-    req.on('error', resolve);
-    req.write(body);
-    req.end();
-  });
-}
-
-// Store audio files in memory for serving
-var audioFiles = {};
-
-// Send audio via public URL link
-function sendAudioMessage(conversationId, audioFilePath) {
-  return new Promise(function(resolve) {
-    if (!fs.existsSync(audioFilePath)) { resolve(false); return; }
+  for (var lang in languages) {
+    var chatIds = languages[lang];
     
-    // Store file and create public ID
-    var audioId = 'audio_' + Date.now();
-    var audioData = fs.readFileSync(audioFilePath);
-    audioFiles[audioId] = { data: audioData, created: Date.now() };
-    
-    // Clean old files older than 10 minutes
-    var now = Date.now();
-    Object.keys(audioFiles).forEach(function(id) {
-      if (now - audioFiles[id].created > 600000) delete audioFiles[id];
-    });
-    
-    var RAILWAY_URL = process.env.RAILWAY_PUBLIC_DOMAIN || 'watchparty-production-d9f0.up.railway.app';
-    var audioUrl = 'https://' + RAILWAY_URL + '/audio/' + audioId;
-    
-    // Send as text link
-    var linkMsg = '🎙️ Sheng Commentary Voice Note:\n' + audioUrl + '\n\nTap the link to hear it!';
-    
-    var body = JSON.stringify({ content: linkMsg, message_type: 'outgoing', private: false });
-    var options = {
-      hostname: CHATWOOT_URL,
-      path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages',
-      method: 'POST',
-      headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'application/json', 'content-length': Buffer.byteLength(body) }
-    };
-    var req = https.request(options, function(res) {
-      var data = '';
-      res.on('data', function(chunk) { data += chunk; });
-      res.on('end', function() {
-        console.log('Audio link sent!');
-        try { fs.unlinkSync(audioFilePath); } catch(e) {}
-        resolve(true);
-      });
-    });
-    req.on('error', function(e) { console.log('Audio link error:', e.message); resolve(false); });
-    req.write(body);
-    req.end();
-  });
-}
+    // Generate ONE commentary for all subscribers of this language
+    var commentary = await generateCommentary(event, matchInfo, lang, fixtureId);
+    if (!commentary) continue;
 
-// Process match event and send commentary
-async function processEvent(event, matchInfo, conversationId, language) {
-  try {
-    // Only process important events
-    if (!['Goal', 'Card', 'subst'].includes(event.type)) return;
+    // Build text message
+    var emoji = event.type === 'Goal' ? '⚽' : '🟥';
+    var textMsg = emoji + ' <b>' + event.time + "' " + event.type.toUpperCase() + '!</b>\n';
+    textMsg += '<b>' + (event.team || '') + '</b>\n';
+    if (event.player) textMsg += event.player + '\n';
+    textMsg += '\n' + commentary;
 
-    console.log('Processing event:', event.type, 'for conversation:', conversationId);
-
-    // Generate commentary
-    var commentary = await generateCommentary(event, matchInfo, language);
-    if (!commentary) return;
-
-    console.log('Commentary generated:', commentary.substring(0, 80));
-
-    // Send text first immediately
-    var textMsg = '';
-    if (event.type === 'Goal') textMsg = '⚽ ' + event.time.elapsed + '\' GOAL!\n' + (event.team && event.team.name) + '\n' + (event.player && event.player.name) + '\n\n' + commentary;
-    else if (event.type === 'Card') textMsg = '🟨 ' + event.time.elapsed + '\' ' + (event.detail || 'CARD') + '\n' + (event.player && event.player.name) + '\n\n' + commentary;
-    else textMsg = '🔄 ' + event.time.elapsed + '\' SUBSTITUTION\n\n' + commentary;
-
-    await sendMessage(conversationId, textMsg);
-
-    // Try to generate and send voice note if Google TTS key available
-    if (process.env.AZURE_SPEECH_KEY) {
-      var audioFile = await textToSpeech(commentary, language);
-      if (audioFile) {
-        await sendAudioMessage(conversationId, audioFile);
-        console.log('Voice note sent!');
-      }
-    } else {
-      console.log('No Azure TTS key — text only mode');
+    // Generate ONE voice for all subscribers
+    var audioBuffer = null;
+    if (AZURE_KEY) {
+      var spokenScript = await generateSpokenScript(commentary, lang);
+      audioBuffer = await textToVoice(spokenScript || commentary, lang);
     }
 
-  } catch(e) { console.log('Process event error:', e.message); }
+    // Send to all subscribers of this language
+    for (var i = 0; i < chatIds.length; i++) {
+      var chatId = chatIds[i];
+      try {
+        await sendText(chatId, textMsg);
+        if (audioBuffer) {
+          var voiceResult = await sendVoiceBuffer(chatId, audioBuffer);
+          console.log('Voice sent to:', chatId, voiceResult && voiceResult.ok ? 'OK' : 'FAILED');
+        }
+        // Small delay to avoid Telegram rate limits
+        await new Promise(function(r) { setTimeout(r, 100); });
+      } catch(e) { console.log('Send error for', chatId, ':', e.message); }
+    }
+    console.log('Broadcast complete for', lang, ':', chatIds.length, 'subscribers');
+  }
 }
 
-// Poll match for new events
-async function pollMatch(fixtureId, matchInfo, subscribers) {
+// ============= POLL MATCHES =============
+async function pollMatch(fixtureId, matchInfo, homeTeam, awayTeam) {
   try {
-    // Check if match is still LIVE first
-    var fixtureCheck = await footballAPI('/fixtures?id=' + fixtureId);
-    if (fixtureCheck && fixtureCheck.response && fixtureCheck.response[0]) {
-      var status = fixtureCheck.response[0].fixture.status.short;
-      if (!['1H', '2H', 'ET', 'P', 'HT'].includes(status)) {
-        console.log('Match', fixtureId, 'finished (status:', status, ') - stopping polling');
+    // Check match is still live
+    var fixtureResult = await highlightlyAPI('/matches/' + fixtureId);
+    if (fixtureResult) {
+      var status = fixtureResult.status || fixtureResult.fixture && fixtureResult.fixture.status;
+      if (status && ['FT', 'AET', 'PEN', 'ABD', 'CANC'].includes(status)) {
+        console.log('Match', fixtureId, 'finished - stopping polling');
         if (matchPolling[fixtureId]) { clearInterval(matchPolling[fixtureId]); delete matchPolling[fixtureId]; }
         return;
       }
     }
 
-    var result = await footballAPI('/fixtures/events?fixture=' + fixtureId);
-    if (!result || !result.response) return;
+    // Get match events
+    var eventsResult = await highlightlyAPI('/matches/' + fixtureId + '/events');
+    if (!eventsResult || !eventsResult.events) return;
 
-    var events = result.response;
+    var events = eventsResult.events;
+    var key = 'fixture_' + fixtureId;
+    var lastIdx = lastEventIndex[key] || 0;
+    var newEvents = events.slice(lastIdx);
 
-    for (var convId in subscribers) {
-      var sub = subscribers[convId];
-      if (sub.fixtureId !== fixtureId) continue;
-
-      var lastIndex = sub.lastEventIndex || 0;
-      var newEvents = events.slice(lastIndex);
-
+    if (newEvents.length > 0) {
+      lastEventIndex[key] = events.length;
       for (var i = 0; i < newEvents.length; i++) {
         var evt = newEvents[i];
-        // Only goals and red cards
-        if (evt.type === 'Goal') {
-          await processEvent(evt, matchInfo, convId, sub.language || 'sheng');
-        } else if (evt.type === 'Card' && evt.detail === 'Red Card') {
-          await processEvent(evt, matchInfo, convId, sub.language || 'sheng');
+        if (evt.type === 'Goal' || (evt.type === 'Card' && evt.detail === 'Red Card')) {
+          await broadcastToSubscribers(evt, matchInfo, homeTeam, awayTeam, fixtureId);
         }
-        sub.lastEventIndex = lastIndex + i + 1;
       }
     }
   } catch(e) { console.log('Poll error:', e.message); }
 }
 
-var server = http.createServer(async function(req, res) {
+// Start polling live matches
+async function startPolling() {
+  try {
+    var result = await highlightlyAPI('/matches?status=live');
+    if (!result || !result.matches) return;
+    result.matches.forEach(function(m) {
+      var fixtureId = m.id || m.fixture_id;
+      var homeTeam = m.homeTeam && m.homeTeam.name || m.home || 'Home';
+      var awayTeam = m.awayTeam && m.awayTeam.name || m.away || 'Away';
+      var matchInfo = homeTeam + ' vs ' + awayTeam;
+      if (!matchPolling[fixtureId]) {
+        matchPolling[fixtureId] = setInterval(function() {
+          pollMatch(fixtureId, matchInfo, homeTeam, awayTeam);
+        }, 60000);
+        console.log('Polling:', matchInfo);
+      }
+    });
+    console.log('Active polls:', Object.keys(matchPolling).length);
+  } catch(e) { console.log('Start polling error:', e.message); }
+}
 
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200); res.end('WatchParty AI Running! Subscriptions: ' + Object.keys(subscriptions).length); return;
+// ============= HANDLE TELEGRAM COMMANDS =============
+async function handleUpdate(update) {
+  if (!update.message) return;
+  var chatId = String(update.message.chat.id);
+  var text = (update.message.text || '').trim();
+  var firstName = update.message.from && update.message.from.first_name || 'Boss';
+
+  console.log('Message from', chatId, ':', text.substring(0, 50));
+
+  if (text === '/start') {
+    await sendText(chatId, '🔥⚽ <b>WatchParty AI — Football in Sheng!</b>\n\nHabari ' + firstName + '! Karibu!\n\nGet live Sheng commentary for every goal and red card!\n\n<b>Commands:</b>\n/subscribe Arsenal sheng\n/subscribe ManCity swahili\n/subscribe all sheng — ALL matches!\n/live — Live matches now\n/status — Your subscriptions\n/stop — Unsubscribe\n\n<b>Languages:</b> sheng • swahili • somali • english\n\nLet\'s go! 🔥');
+    return;
   }
 
-  // Serve audio files
-  if (req.method === 'GET' && req.url.startsWith('/audio/')) {
-    var audioId = req.url.replace('/audio/', '');
-    if (audioFiles[audioId]) {
-      res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': audioFiles[audioId].data.length });
-      res.end(audioFiles[audioId].data);
+  if (text === '/live') {
+    var liveResult = await highlightlyAPI('/matches?status=live');
+    if (!liveResult || !liveResult.matches || liveResult.matches.length === 0) {
+      await sendText(chatId, '⚽ No live matches right now. Check back later!');
+      return;
+    }
+    var msg = '⚽ <b>LIVE NOW:</b>\n\n';
+    liveResult.matches.slice(0, 10).forEach(function(m) {
+      var home = m.homeTeam && m.homeTeam.name || m.home || 'Home';
+      var away = m.awayTeam && m.awayTeam.name || m.away || 'Away';
+      var score = (m.score || m.goals || '? - ?');
+      msg += '<b>' + home + '</b> vs <b>' + away + '</b> ' + score + '\n';
+      if (m.league) msg += '<i>' + m.league + '</i>\n';
+      msg += '\n';
+    });
+    await sendText(chatId, msg);
+    return;
+  }
+
+  if (text === '/status') {
+    var sub = subscribers[chatId];
+    if (!sub || !sub.teams || sub.teams.length === 0) {
+      await sendText(chatId, 'You are not subscribed!\n\nUse: /subscribe Arsenal sheng');
     } else {
-      res.writeHead(404); res.end('Audio not found');
+      await sendText(chatId, '✅ <b>Your subscriptions:</b>\nTeams: ' + sub.teams.join(', ') + '\nLanguage: ' + sub.language + '\n\nUse /stop to unsubscribe.');
     }
     return;
   }
 
-  if (req.method === 'GET' && req.url === '/test') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    footballAPI('/status').then(function(result) {
-      if (result && result.response) {
-        res.end(JSON.stringify({ success: true, requests_today: result.response.requests.current, remaining: result.response.requests.limit_day - result.response.requests.current, voice_enabled: !!process.env.AZURE_SPEECH_KEY }));
-      } else { res.end(JSON.stringify({ success: false })); }
-    }); return;
+  if (text === '/stop') {
+    delete subscribers[chatId];
+    await sendText(chatId, '❌ Unsubscribed! Use /subscribe to rejoin anytime.');
+    return;
   }
 
-  if (req.method === 'GET' && req.url === '/live') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    footballAPI('/fixtures?live=all').then(function(result) {
-      var matches = (result && result.response || []).map(function(m) {
-        return { fixture_id: m.fixture.id, home: m.teams.home.name, away: m.teams.away.name, score: m.goals.home + '-' + m.goals.away, minute: m.fixture.status.elapsed, league: m.league.name, country: m.league.country };
-      });
-      res.end(JSON.stringify({ live_matches: matches, count: matches.length }));
-    }); return;
+  if (text.startsWith('/subscribe')) {
+    var parts = text.split(' ');
+    var team = parts[1] || 'all';
+    var lang = (parts[2] || 'sheng').toLowerCase();
+    var validLangs = ['sheng', 'swahili', 'somali', 'english'];
+    if (!validLangs.includes(lang)) lang = 'sheng';
+    if (!subscribers[chatId]) subscribers[chatId] = { teams: [], language: lang, active: true };
+    if (!subscribers[chatId].teams.includes(team)) subscribers[chatId].teams.push(team);
+    subscribers[chatId].language = lang;
+    subscribers[chatId].active = true;
+    var teamDisplay = team === 'all' ? 'ALL matches' : team;
+    await sendText(chatId, '✅ <b>Subscribed!</b>\n\nTeam: <b>' + teamDisplay + '</b>\nLanguage: <b>' + lang.toUpperCase() + '</b>\n\nYou will receive:\n🔥 Text commentary\n🎙️ Voice note (' + (AZURE_KEY ? 'Kenyan Swahili voice' : 'coming soon') + ')\n\nWaiting for next goal... ⚽');
+    await startPolling();
+    return;
   }
 
-  // Demo commentary - test text + voice
-  if (req.method === 'GET' && req.url.startsWith('/demo-commentary')) {
-    var lang = req.url.includes('?lang=') ? req.url.split('?lang=')[1] : 'sheng';
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    var testEvent = { time: { elapsed: 23 }, type: 'Goal', team: { name: 'Arsenal' }, player: { name: 'Saka' }, assist: { name: 'Odegaard' }, detail: 'right foot shot' };
-    var commentary = await generateCommentary(testEvent, 'Arsenal vs Man City - Premier League', lang);
-    var output = 'WatchParty AI - ' + lang.toUpperCase() + ' Commentary\n\n';
-    output += 'Match: Arsenal vs Man City\n';
-    output += 'Event: GOAL by Saka - Minute 23\n\n';
-    output += commentary + '\n\n';
-    if (process.env.AZURE_SPEECH_KEY) {
-      var audioFile = await textToSpeech(commentary, lang);
-      output += audioFile ? 'Voice note generated: ' + audioFile : 'Voice note failed!';
-    } else {
-      output += 'Voice note: Add AZURE_SPEECH_KEY to Railway variables!';
-    }
-    res.end(output); return;
+  await sendText(chatId, 'Use /start to see commands! ⚽\n\nOr type /subscribe Arsenal sheng to get started!');
+}
+
+// ============= HTTP SERVER =============
+var server = http.createServer(async function(req, res) {
+
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200);
+    res.end('WatchParty Telegram Bot Running!\nSubscribers: ' + Object.keys(subscribers).length + '\nActive polls: ' + Object.keys(matchPolling).length);
+    return;
   }
 
-  // Live commentary test
-  if (req.method === 'GET' && req.url.startsWith('/live-commentary')) {
-    var lang2 = req.url.includes('?lang=') ? req.url.split('?lang=')[1] : 'sheng';
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    var liveResult = await footballAPI('/fixtures?live=all');
-    if (!liveResult || !liveResult.response || liveResult.response.length === 0) {
-      res.end('No live matches right now. Try again later!'); return;
-    }
-    var match = liveResult.response[0];
-    var fixtureId = match.fixture.id;
-    var matchInfo2 = match.teams.home.name + ' vs ' + match.teams.away.name + ' - ' + match.league.name;
-    var score = match.goals.home + '-' + match.goals.away;
-    var minute = match.fixture.status.elapsed;
-    var eventsResult = await footballAPI('/fixtures/events?fixture=' + fixtureId);
-    var output2 = 'WatchParty AI - LIVE Commentary\n';
-    output2 += 'Match: ' + matchInfo2 + '\n';
-    output2 += 'Score: ' + score + ' | Minute: ' + minute + '\n';
-    output2 += 'Language: ' + lang2.toUpperCase() + '\n\n';
-    if (eventsResult && eventsResult.response && eventsResult.response.length > 0) {
-      var lastEvent = eventsResult.response[eventsResult.response.length - 1];
-      var commentary2 = await generateCommentary(lastEvent, matchInfo2, lang2);
-      output2 += 'Last event: ' + lastEvent.type + ' - Minute ' + lastEvent.time.elapsed + '\n\n';
-      output2 += commentary2;
-    } else {
-      var updateEvent = { time: { elapsed: minute }, type: 'Goal', team: { name: match.teams.home.name }, player: { name: 'Player' }, detail: 'Score is ' + score };
-      var commentary3 = await generateCommentary(updateEvent, matchInfo2, lang2);
-      output2 += commentary3;
-    }
-    res.end(output2); return;
-  }
-
-  // Subscribe to match - send commentary to WhatsApp
-  if (req.method === 'GET' && req.url.startsWith('/subscribe/')) {
-    var parts = req.url.split('/');
-    var convId = parts[2];
-    var fixId = parseInt(parts[3]);
-    var subLang = parts[4] || 'sheng';
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-
-    // Get match info
-    var matchResult = await footballAPI('/fixtures?id=' + fixId);
-    if (!matchResult || !matchResult.response || matchResult.response.length === 0) {
-      res.end(JSON.stringify({ error: 'Match not found' })); return;
-    }
-
-    var m = matchResult.response[0];
-    var mInfo = m.teams.home.name + ' vs ' + m.teams.away.name + ' - ' + m.league.name;
-
-    // Add subscription
-    subscriptions[convId] = { fixtureId: fixId, language: subLang, lastEventIndex: 0, matchInfo: mInfo };
-
-    // Start polling if not already
-    if (!matchPolling[fixId]) {
-      matchPolling[fixId] = setInterval(async function() {
-        await pollMatch(fixId, mInfo, subscriptions);
-      }, 30000); // Poll every 30 seconds
-      console.log('Started polling match:', fixId);
-    }
-
-    // Send confirmation
-    await sendMessage(convId, 'WatchParty AI activated! \n\nMatch: ' + mInfo + '\nLanguage: ' + subLang.toUpperCase() + '\n\nYou will receive ' + (process.env.AZURE_SPEECH_KEY ? 'voice notes' : 'text alerts') + ' for goals, cards and substitutions!\n\nReply with team name or "stop" to unsubscribe.');
-
-    res.end(JSON.stringify({ success: true, message: 'Subscribed to ' + mInfo, language: subLang, voice: !!process.env.AZURE_SPEECH_KEY }));
+  if (req.method === 'POST' && req.url === '/webhook') {
+    var body = '';
+    req.on('data', function(c) { body += c; });
+    req.on('end', async function() {
+      res.writeHead(200); res.end('OK');
+      try { var update = JSON.parse(body); await handleUpdate(update); }
+      catch(e) { console.log('Webhook error:', e.message); }
+    });
     return;
   }
 
   res.writeHead(200);
-  res.end('WatchParty AI Ready!\nEndpoints:\n/health\n/test\n/live\n/demo-commentary?lang=sheng\n/live-commentary?lang=sheng\n/subscribe/:conversationId/:fixtureId/:language');
+  res.end('WatchParty AI Telegram Bot\nEndpoints: /health /webhook');
 });
 
-server.listen(PORT, function() {
-  console.log('WatchParty AI starting on port ' + PORT);
-  console.log('Voice enabled:', !!process.env.AZURE_SPEECH_KEY);
-  console.log('WatchParty AI Ready!');
+server.listen(PORT, async function() {
+  console.log('WatchParty Telegram Bot starting on port ' + PORT);
+  console.log('Voice enabled:', !!AZURE_KEY);
+  console.log('Highlightly API:', !!HIGHLIGHTLY_KEY);
+
+  // Set Telegram webhook
+  if (TELEGRAM_TOKEN) {
+    var webhookUrl = 'https://' + (process.env.RAILWAY_PUBLIC_DOMAIN || 'watchparty-production-d9f0.up.railway.app') + '/webhook';
+    var result = await telegramAPI('setWebhook', { url: webhookUrl });
+    console.log('Webhook:', result && result.ok ? 'SET ✅' : 'FAILED ❌');
+  }
+
+  // Poll live matches every 5 minutes
+  setInterval(startPolling, 5 * 60 * 1000);
+  await startPolling();
+
+  console.log('WatchParty Telegram Bot Ready! 🔥⚽');
 });
