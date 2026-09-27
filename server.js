@@ -39,11 +39,14 @@ function footballAPI(path) {
 // Generate commentary using Claude
 function generateCommentary(event, matchInfo, language) {
   return new Promise(function(resolve) {
-    var langStyle = {
-      'sheng': 'Pure Nairobi Sheng slang. Use words like: boss, moto, chana, safi, fala, rada, chizi, poa, kibao, msee, dawa, wueh, bana, noma. VERY energetic and street style! Keep under 50 words!',
-      'swahili': 'Msisimko wa Kiswahili safi. Fasaha na ya kusisimua. Maneno mafupi mazuri. Chini ya maneno 50!',
-      'somali': 'Somali football commentary. Passionate and energetic. Under 50 words!',
-      'english': 'East African English with Nairobi personality. Fun and energetic. Under 50 words!'
+    var personalities = ['Shocked and excited', 'Sarcastic banter', 'Calm analysis', 'Dramatic over-reaction', 'Funny rivalry teasing'];
+    var personality = personalities[Math.floor(Math.random() * personalities.length)];
+
+    langStyle = {
+      'sheng': 'Write EXACTLY as a young Nairobi man SPEAKING to friends watching football. Natural Sheng — not forced slang list. Short punchy sentences. Style: ' + personality + '. Under 50 words!',
+      'swahili': 'Andika kama shabiki wa Nairobi anayeongea na marafiki. Kiswahili cha mtaani. Fupi na yenye nguvu. Style: ' + personality + '. Maneno chini ya 50!',
+      'somali': 'Qor sida taageere Soomaali ah oo la hadlaya saaxiibbadiis. Gaaban oo kulul. Style: ' + personality + '. Waa ka yar 50 ereyood!',
+      'english': 'Write as excited East African fan talking to friends. Casual natural English with local flavor. Style: ' + personality + '. Under 50 words!'
     };
 
     var eventDesc = '';
@@ -98,9 +101,9 @@ function textToSpeech(text, language) {
 
     // Voice selection per language
     var voiceName = {
-      'sheng': 'en-US-AriaNeural',
-      'swahili': 'en-US-AriaNeural',
-      'somali': 'en-US-AriaNeural',
+      'sheng': 'sw-KE-RafikiNeural',
+      'swahili': 'sw-KE-RafikiNeural',
+      'somali': 'sw-KE-RafikiNeural',
       'english': 'en-US-AriaNeural'
     };
 
@@ -115,7 +118,8 @@ function textToSpeech(text, language) {
     if (!cleanText || cleanText.length < 5) { resolve(null); return; }
 
     // Azure SSML
-    var ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">';
+    var langCode = language === 'english' ? 'en-US' : 'sw-KE';
+    var ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="' + langCode + '">';
     ssml += '<voice name="' + (voiceName[language] || 'sw-KE-ZuriNeural') + '">';
     ssml += '<prosody rate="1.2" pitch="+5%">';
     ssml += cleanText;
