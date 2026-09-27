@@ -24,7 +24,11 @@ function highlightlyAPI(path) {
       hostname: 'soccer.highlightly.net',
       path: path,
       method: 'GET',
-      headers: { 'x-api-key': HIGHLIGHTLY_KEY }
+      headers: { 
+        'x-api-key': HIGHLIGHTLY_KEY,
+        'x-rapidapi-key': HIGHLIGHTLY_KEY,
+        'Content-Type': 'application/json'
+      }
     };
     var req = https.request(options, function(res) {
       var d = '';
