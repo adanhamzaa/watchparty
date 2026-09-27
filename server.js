@@ -309,16 +309,20 @@ async function startPolling() {
     // Get today's date in YYYY-MM-DD format
     var today = new Date().toISOString().split('T')[0];
     var result = await highlightlyAPI('/matches?date=' + today + '&timezone=Africa/Nairobi&limit=50');
-    if (!result || !Array.isArray(result)) {
-      console.log('Highlightly response:', JSON.stringify(result).substring(0, 200));
+    // Handle both array and {data:[]} response formats
+    var matches = Array.isArray(result) ? result : (result && result.data ? result.data : []);
+    if (matches.length === 0) {
+      console.log('No matches found. Raw response:', JSON.stringify(result).substring(0, 300));
       return;
     }
-    // Filter only live matches
-    var liveMatches = result.filter(function(m) {
-      var state = m.state || m.status || m.matchState || '';
-      return ['1H', '2H', 'HT', 'ET', 'P', 'LIVE', 'IN_PLAY', 'live', 'inplay'].includes(state);
+    // Filter only live matches - check all possible state formats
+    var liveMatches = matches.filter(function(m) {
+      var state = (m.state && (m.state.description || m.state.status || m.state)) || m.status || m.matchState || '';
+      if (typeof state === 'object') state = state.description || state.status || '';
+      state = String(state).toUpperCase();
+      return ['1H', '2H', 'HT', 'ET', 'P', 'LIVE', 'IN_PLAY', 'INPLAY', 'FIRST_HALF', 'SECOND_HALF'].some(function(s) { return state.includes(s); });
     });
-    console.log('Total matches today:', result.length, 'Live:', liveMatches.length);
+    console.log('Total matches today:', matches.length, 'Live:', liveMatches.length);
     liveMatches.forEach(function(m) {
       var fixtureId = m.id || m.matchId;
       var homeTeam = m.homeTeam && m.homeTeam.name || 'Home';
