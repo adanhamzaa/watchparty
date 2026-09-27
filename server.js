@@ -278,8 +278,9 @@ async function pollMatch(fixtureId, matchInfo, homeTeam, awayTeam) {
     var matchData = Array.isArray(fixtureResult) ? fixtureResult[0] : fixtureResult;
     if (!matchData) return;
     
-    var status = matchData.state || matchData.status || matchData.matchState || '';
-    if (['FT', 'AET', 'PEN', 'ABD', 'CANC', 'finished', 'ended'].includes(status)) {
+    var stateDesc = (matchData.state && matchData.state.description) || '';
+    stateDesc = String(stateDesc).toLowerCase();
+    if (stateDesc.includes('ended') || stateDesc.includes('finished') || stateDesc.includes('full time') || stateDesc.includes('abandoned') || stateDesc.includes('cancelled')) {
       console.log('Match', fixtureId, 'finished - stopping polling');
       if (matchPolling[fixtureId]) { clearInterval(matchPolling[fixtureId]); delete matchPolling[fixtureId]; }
       return;
@@ -317,10 +318,9 @@ async function startPolling() {
     }
     // Filter only live matches - check all possible state formats
     var liveMatches = matches.filter(function(m) {
-      var state = (m.state && (m.state.description || m.state.status || m.state)) || m.status || m.matchState || '';
-      if (typeof state === 'object') state = state.description || state.status || '';
-      state = String(state).toUpperCase();
-      return ['1H', '2H', 'HT', 'ET', 'P', 'LIVE', 'IN_PLAY', 'INPLAY', 'FIRST_HALF', 'SECOND_HALF'].some(function(s) { return state.includes(s); });
+      var desc = (m.state && m.state.description) || '';
+      desc = String(desc).toLowerCase();
+      return desc.includes('half') || desc.includes('extra') || desc.includes('live') || desc.includes('progress') || desc.includes('penalties');
     });
     console.log('Total matches today:', matches.length, 'Live:', liveMatches.length);
     liveMatches.forEach(function(m) {
