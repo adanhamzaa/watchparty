@@ -275,12 +275,6 @@ async function pollMatch(fixtureId, matchInfo, subscribers) {
       }
     }
 
-    // Time check - only send 6AM-11PM Nairobi
-    var now = new Date();
-    var nairobi = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-    var hour = nairobi.getHours();
-    if (hour < 6 || hour >= 23) { console.log('Outside hours:', hour); return; }
-
     var result = await footballAPI('/fixtures/events?fixture=' + fixtureId);
     if (!result || !result.response) return;
 
