@@ -268,22 +268,22 @@ async function broadcastToSubscribers(event, matchInfo, homeTeam, awayTeam, fixt
 // ============= POLL MATCHES =============
 async function pollMatch(fixtureId, matchInfo, homeTeam, awayTeam) {
   try {
-    // Check match is still live
+    // Check match status and get events
     var fixtureResult = await highlightlyAPI('/matches/' + fixtureId);
-    if (fixtureResult) {
-      var status = fixtureResult.status || fixtureResult.fixture && fixtureResult.fixture.status;
-      if (status && ['FT', 'AET', 'PEN', 'ABD', 'CANC'].includes(status)) {
-        console.log('Match', fixtureId, 'finished - stopping polling');
-        if (matchPolling[fixtureId]) { clearInterval(matchPolling[fixtureId]); delete matchPolling[fixtureId]; }
-        return;
-      }
+    if (!fixtureResult) return;
+    
+    var matchData = Array.isArray(fixtureResult) ? fixtureResult[0] : fixtureResult;
+    if (!matchData) return;
+    
+    var status = matchData.state || matchData.status || matchData.matchState || '';
+    if (['FT', 'AET', 'PEN', 'ABD', 'CANC', 'finished', 'ended'].includes(status)) {
+      console.log('Match', fixtureId, 'finished - stopping polling');
+      if (matchPolling[fixtureId]) { clearInterval(matchPolling[fixtureId]); delete matchPolling[fixtureId]; }
+      return;
     }
 
-    // Get match events
-    var eventsResult = await highlightlyAPI('/matches/' + fixtureId + '/events');
-    if (!eventsResult || !eventsResult.events) return;
-
-    var events = eventsResult.events;
+    var events = matchData.events || matchData.matchEvents || [];
+    if (!Array.isArray(events)) events = [];
     var key = 'fixture_' + fixtureId;
     var lastIdx = lastEventIndex[key] || 0;
     var newEvents = events.slice(lastIdx);
@@ -303,12 +303,23 @@ async function pollMatch(fixtureId, matchInfo, homeTeam, awayTeam) {
 // Start polling live matches
 async function startPolling() {
   try {
-    var result = await highlightlyAPI('/matches?status=live');
-    if (!result || !result.matches) return;
-    result.matches.forEach(function(m) {
-      var fixtureId = m.id || m.fixture_id;
-      var homeTeam = m.homeTeam && m.homeTeam.name || m.home || 'Home';
-      var awayTeam = m.awayTeam && m.awayTeam.name || m.away || 'Away';
+    // Get today's date in YYYY-MM-DD format
+    var today = new Date().toISOString().split('T')[0];
+    var result = await highlightlyAPI('/matches?date=' + today + '&timezone=Africa/Nairobi&limit=50');
+    if (!result || !Array.isArray(result)) {
+      console.log('Highlightly response:', JSON.stringify(result).substring(0, 200));
+      return;
+    }
+    // Filter only live matches
+    var liveMatches = result.filter(function(m) {
+      var state = m.state || m.status || m.matchState || '';
+      return ['1H', '2H', 'HT', 'ET', 'P', 'LIVE', 'IN_PLAY', 'live', 'inplay'].includes(state);
+    });
+    console.log('Total matches today:', result.length, 'Live:', liveMatches.length);
+    liveMatches.forEach(function(m) {
+      var fixtureId = m.id || m.matchId;
+      var homeTeam = m.homeTeam && m.homeTeam.name || 'Home';
+      var awayTeam = m.awayTeam && m.awayTeam.name || 'Away';
       var matchInfo = homeTeam + ' vs ' + awayTeam;
       if (!matchPolling[fixtureId]) {
         matchPolling[fixtureId] = setInterval(function() {
