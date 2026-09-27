@@ -25,7 +25,6 @@ function highlightlyAPI(path) {
       path: path,
       method: 'GET',
       headers: { 
-        'x-api-key': HIGHLIGHTLY_KEY,
         'x-rapidapi-key': HIGHLIGHTLY_KEY,
         'Content-Type': 'application/json'
       }
