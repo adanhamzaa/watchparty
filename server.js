@@ -201,6 +201,64 @@ function textToVoice(text, language) {
   });
 }
 
+// ============= SEARCH FOR GOAL VIDEO =============
+async function searchGoalVideo(event, homeTeam, awayTeam, fixtureId) {
+  var playerName = event.player || '';
+  var team = event.team || homeTeam;
+  var minute = event.time || '?';
+
+  console.log('Searching for video:', team, 'goal', minute + 'min');
+
+  // Step 1 — Try Highlightly
+  try {
+    var today = new Date().toISOString().split('T')[0];
+    var hlResult = await highlightlyAPI('/matches/' + fixtureId + '/highlights');
+    if (hlResult && Array.isArray(hlResult) && hlResult.length > 0) {
+      var hlUrl = hlResult[0].url || hlResult[0].videoUrl || hlResult[0].embedUrl;
+      if (hlUrl) { console.log('Highlightly video found!'); return hlUrl; }
+    }
+    // Try alternative Highlightly endpoint
+    var hlResult2 = await highlightlyAPI('/highlights?matchId=' + fixtureId);
+    if (hlResult2 && hlResult2.data && hlResult2.data.length > 0) {
+      var hlUrl2 = hlResult2.data[0].url || hlResult2.data[0].videoUrl;
+      if (hlUrl2) { console.log('Highlightly video found (alt)!'); return hlUrl2; }
+    }
+    console.log('Highlightly: no video found');
+  } catch(e) { console.log('Highlightly video error:', e.message); }
+
+  // Step 2 — Try ScoreBat as backup
+  try {
+    var searchQuery = encodeURIComponent(homeTeam + ' ' + awayTeam);
+    var scorebatResult = await new Promise(function(resolve) {
+      var options = {
+        hostname: 'www.scorebat.com',
+        path: '/video-api/v3/feed/?token=free&q=' + searchQuery,
+        method: 'GET',
+        headers: { 'Accept': 'application/json' }
+      };
+      var req = https.request(options, function(res) {
+        var d = '';
+        res.on('data', function(c) { d += c; });
+        res.on('end', function() {
+          try { resolve(JSON.parse(d)); }
+          catch(e) { resolve(null); }
+        });
+      });
+      req.on('error', function() { resolve(null); });
+      setTimeout(function() { req.destroy(); resolve(null); }, 10000);
+      req.end();
+    });
+    if (scorebatResult && scorebatResult.response && scorebatResult.response.length > 0) {
+      var sbVideo = scorebatResult.response[0];
+      var sbUrl = sbVideo.videos && sbVideo.videos[0] && sbVideo.videos[0].embed;
+      if (sbUrl) { console.log('ScoreBat video found!'); return sbUrl; }
+    }
+    console.log('ScoreBat: no video found');
+  } catch(e) { console.log('ScoreBat video error:', e.message); }
+
+  return null;
+}
+
 // ============= BROADCAST TO ALL SUBSCRIBERS =============
 async function broadcastToSubscribers(event, matchInfo, homeTeam, awayTeam, fixtureId) {
   var relevantSubs = [];
@@ -266,6 +324,34 @@ async function broadcastToSubscribers(event, matchInfo, homeTeam, awayTeam, fixt
     }
     console.log('Broadcast complete for', lang, ':', chatIds.length, 'subscribers');
   }
+
+  // Search for video 10 minutes after goal
+  var goalTime = Date.now();
+  setTimeout(async function() {
+    var videoUrl = await searchGoalVideo(event, homeTeam, awayTeam, fixtureId);
+    if (videoUrl) {
+      var delaySecs = Math.round((Date.now() - goalTime) / 1000);
+      console.log('Video found! Delay:', delaySecs, 'seconds');
+      var videoMsg = 'Watch the goal: ' + videoUrl;
+      for (var chatId in subscribers) {
+        var sub = subscribers[chatId];
+        if (!sub.active) continue;
+        var shouldSend = false;
+        if (sub.teams && sub.teams.includes('all')) shouldSend = true;
+        else if (sub.teams) {
+          sub.teams.forEach(function(t) {
+            if (homeTeam.toLowerCase().includes(t.toLowerCase()) || awayTeam.toLowerCase().includes(t.toLowerCase())) shouldSend = true;
+          });
+        }
+        if (shouldSend) {
+          try { await sendText(chatId, videoMsg); await new Promise(function(r) { setTimeout(r, 100); }); }
+          catch(e) { console.log('Video send error:', e.message); }
+        }
+      }
+    } else {
+      console.log('No video found after 10 minutes');
+    }
+  }, 10 * 60 * 1000);
 }
 
 // ============= POLL MATCHES =============
