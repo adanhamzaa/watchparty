@@ -1,6 +1,6 @@
 const https = require('https');
 const http = require('http');
-
+ 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
 const HIGHLIGHTLY_KEY = process.env.HIGHLIGHTLY_API_KEY;
 const CHATWOOT_URL = process.env.CHATWOOT_URL || 'chatwoot-production-5bb4.up.railway.app';
