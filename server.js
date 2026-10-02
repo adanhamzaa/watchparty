@@ -1,4 +1,4 @@
-const https = require('https');
+]const https = require('https');
 const http = require('http');
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
@@ -8,6 +8,7 @@ const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
 const PORT = process.env.PORT || 3000;
 const AZURE_KEY = process.env.AZURE_SPEECH_KEY;
 const AZURE_REGION = process.env.AZURE_SPEECH_REGION || 'eastus';
+const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
 
 // Subscriber database
 // { conversationId: { teams: ['Arsenal'], language: 'sheng', active: true, phone: '254...' } }
@@ -37,6 +38,25 @@ function highlightlyAPI(path) {
     var options = {
       hostname: 'soccer.highlightly.net', path: path, method: 'GET',
       headers: { 'x-rapidapi-key': HIGHLIGHTLY_KEY, 'Content-Type': 'application/json' }
+    };
+    var req = https.request(options, function(res) {
+      var d = '';
+      res.on('data', function(c) { d += c; });
+      res.on('end', function() { try { resolve(JSON.parse(d)); } catch(e) { resolve(null); } });
+    });
+    req.on('error', function() { resolve(null); });
+    setTimeout(function() { req.destroy(); resolve(null); }, 10000);
+    req.end();
+  });
+}
+
+// ============= API-FOOTBALL (live goal detection) =============
+function footballAPI(path) {
+  return new Promise(function(resolve) {
+    if (!FOOTBALL_API_KEY) { resolve(null); return; }
+    var options = {
+      hostname: 'v3.football.api-sports.io', path: path, method: 'GET',
+      headers: { 'x-apisports-key': FOOTBALL_API_KEY }
     };
     var req = https.request(options, function(res) {
       var d = '';
@@ -289,21 +309,49 @@ async function broadcastToSubscribers(event, matchInfo, homeTeam, awayTeam, fixt
 }
 
 // ============= POLL LIVE MATCHES =============
-async function pollMatch(fixtureId, matchInfo, homeTeam, awayTeam) {
+async function pollMatch(fixtureId, matchInfo, homeTeam, awayTeam, source) {
   try {
-    var fixtureResult = await highlightlyAPI('/matches/' + fixtureId);
-    if (!fixtureResult) return;
-    var matchData = Array.isArray(fixtureResult) ? fixtureResult[0] : fixtureResult;
-    if (!matchData) return;
-    var stateDesc = (matchData.state && matchData.state.description) || '';
-    stateDesc = String(stateDesc).toLowerCase();
-    if (stateDesc.includes('ended') || stateDesc.includes('finished') || stateDesc.includes('full time')) {
+    var events = [];
+    var matchFinished = false;
+
+    // Use API-Football for event detection (more reliable)
+    if (source === 'api-football' && FOOTBALL_API_KEY) {
+      var afFixture = await footballAPI('/fixtures?id=' + fixtureId);
+      if (afFixture && afFixture.response && afFixture.response[0]) {
+        var af = afFixture.response[0];
+        var afStatus = af.fixture.status.short;
+        if (['FT','AET','PEN','ABD','CANC'].includes(afStatus)) matchFinished = true;
+        var afEvents = await footballAPI('/fixtures/events?fixture=' + fixtureId);
+        if (afEvents && afEvents.response) {
+          events = afEvents.response.map(function(e) {
+            return {
+              type: e.type === 'Goal' ? 'Goal' : (e.detail === 'Red Card' ? 'Card' : e.type),
+              detail: e.detail,
+              player: e.player && e.player.name,
+              team: e.team && e.team.name,
+              time: e.time && e.time.elapsed
+            };
+          });
+        }
+      }
+    } else {
+      // Highlightly fallback
+      var fixtureResult = await highlightlyAPI('/matches/' + fixtureId);
+      if (!fixtureResult) return;
+      var matchData = Array.isArray(fixtureResult) ? fixtureResult[0] : fixtureResult;
+      if (!matchData) return;
+      var stateDesc = (matchData.state && matchData.state.description) || '';
+      stateDesc = String(stateDesc).toLowerCase();
+      if (stateDesc.includes('ended') || stateDesc.includes('finished') || stateDesc.includes('full time')) matchFinished = true;
+      events = matchData.events || matchData.matchEvents || [];
+      if (!Array.isArray(events)) events = [];
+    }
+
+    if (matchFinished) {
       console.log('Match', fixtureId, 'finished - stopping polling');
       if (matchPolling[fixtureId]) { clearInterval(matchPolling[fixtureId]); delete matchPolling[fixtureId]; }
       return;
     }
-    var events = matchData.events || matchData.matchEvents || [];
-    if (!Array.isArray(events)) events = [];
     var key = 'fixture_' + fixtureId;
     var lastIdx = lastEventIndex[key] || 0;
     var newEvents = events.slice(lastIdx);
@@ -321,23 +369,54 @@ async function pollMatch(fixtureId, matchInfo, homeTeam, awayTeam) {
 
 async function startPolling() {
   try {
+    var liveMatches = [];
+
+    // Step 1 — API-Football for live detection (primary)
+    if (FOOTBALL_API_KEY) {
+      var afResult = await footballAPI('/fixtures?live=all');
+      if (afResult && afResult.response && afResult.response.length > 0) {
+        afResult.response.forEach(function(m) {
+          liveMatches.push({
+            fixtureId: m.fixture.id,
+            homeTeam: m.teams.home.name,
+            awayTeam: m.teams.away.name,
+            source: 'api-football'
+          });
+        });
+        console.log('API-Football live matches:', liveMatches.length);
+      }
+    }
+
+    // Step 2 — Highlightly as backup or additional matches
     var today = new Date().toISOString().split('T')[0];
-    var result = await highlightlyAPI('/matches?date=' + today + '&timezone=Africa/Nairobi&limit=50');
-    var matches = Array.isArray(result) ? result : (result && result.data ? result.data : []);
-    var liveMatches = matches.filter(function(m) {
+    var hlResult = await highlightlyAPI('/matches?date=' + today + '&timezone=Africa/Nairobi&limit=50');
+    var hlMatches = Array.isArray(hlResult) ? hlResult : (hlResult && hlResult.data ? hlResult.data : []);
+    var hlLive = hlMatches.filter(function(m) {
       var desc = (m.state && m.state.description) || '';
       desc = String(desc).toLowerCase();
-      return desc.includes('half') || desc.includes('extra') || desc.includes('live') || desc.includes('progress') || desc.includes('penalties');
+      return desc.includes('half') || desc.includes('extra') || desc.includes('live') || desc.includes('progress');
     });
-    console.log('Total matches today:', matches.length, 'Live:', liveMatches.length);
-    liveMatches.forEach(function(m) {
+    hlLive.forEach(function(m) {
       var fixtureId = m.id || m.matchId;
-      var homeTeam = m.homeTeam && m.homeTeam.name || 'Home';
-      var awayTeam = m.awayTeam && m.awayTeam.name || 'Away';
-      var matchInfo = homeTeam + ' vs ' + awayTeam;
-      if (!matchPolling[fixtureId]) {
-        matchPolling[fixtureId] = setInterval(function() { pollMatch(fixtureId, matchInfo, homeTeam, awayTeam); }, 60000);
-        console.log('Polling:', matchInfo);
+      var alreadyAdded = liveMatches.some(function(x) { return String(x.fixtureId) === String(fixtureId); });
+      if (!alreadyAdded) {
+        liveMatches.push({
+          fixtureId: fixtureId,
+          homeTeam: m.homeTeam && m.homeTeam.name || 'Home',
+          awayTeam: m.awayTeam && m.awayTeam.name || 'Away',
+          source: 'highlightly'
+        });
+      }
+    });
+    console.log('Total live matches (both APIs):', liveMatches.length);
+
+    // Start polling each live match
+    liveMatches.forEach(function(m) {
+      if (!matchPolling[m.fixtureId]) {
+        var fId = m.fixtureId; var home = m.homeTeam; var away = m.awayTeam;
+        var info = home + ' vs ' + away;
+        matchPolling[fId] = setInterval(function() { pollMatch(fId, info, home, away, m.source); }, 60000);
+        console.log('Polling:', info, '(' + m.source + ')');
       }
     });
   } catch(e) { console.log('Start polling error:', e.message); }
