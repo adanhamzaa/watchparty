@@ -9,6 +9,8 @@ const PORT = process.env.PORT || 3000;
 const AZURE_KEY = process.env.AZURE_SPEECH_KEY;
 const AZURE_REGION = process.env.AZURE_SPEECH_REGION || 'eastus';
 const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
+const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'p0TiOqMl1M1IbvZ0ke9s';
 
 // Subscriber database
 // { conversationId: { teams: ['Arsenal'], language: 'sheng', active: true, phone: '254...' } }
@@ -235,6 +237,34 @@ function sendVoiceChatwoot(conversationId, audioBuffer) {
   });
 }
 
+
+// ============= ELEVENLABS TTS =============
+function textToVoiceElevenLabs(text) {
+  return new Promise(function(resolve) {
+    if (!ELEVENLABS_KEY) { resolve(null); return; }
+    var cleanText = text.replace(/[^\x00-\x7F]/g, '').replace(/\*\*/g, '').replace(/#\w+/g, '').trim();
+    if (!cleanText || cleanText.length < 5) { resolve(null); return; }
+    var body = JSON.stringify({ text: cleanText, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.3, use_speaker_boost: true } });
+    var options = {
+      hostname: 'api.elevenlabs.io',
+      path: '/v1/text-to-speech/' + ELEVENLABS_VOICE_ID,
+      method: 'POST',
+      headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg', 'Content-Length': Buffer.byteLength(body) }
+    };
+    var req = https.request(options, function(res) {
+      var chunks = [];
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        if (res.statusCode === 200) { console.log('ElevenLabs voice generated!'); resolve(Buffer.concat(chunks)); }
+        else { console.log('ElevenLabs error:', res.statusCode); resolve(null); }
+      });
+    });
+    req.on('error', function(e) { resolve(null); });
+    setTimeout(function() { req.destroy(); resolve(null); }, 20000);
+    req.write(body); req.end();
+  });
+}
+
 // ============= BROADCAST TO WHATSAPP SUBSCRIBERS =============
 async function broadcastToSubscribers(event, matchInfo, homeTeam, awayTeam, fixtureId) {
   var relevantSubs = [];
@@ -272,11 +302,16 @@ async function broadcastToSubscribers(event, matchInfo, homeTeam, awayTeam, fixt
     if (event.player) textMsg += event.player + '\n';
     textMsg += '\n' + commentary;
 
-    // Generate voice
+    // Generate voice — ElevenLabs first, Azure fallback
     var audioBuffer = null;
-    if (AZURE_KEY) {
-      var spokenScript = await generateSpokenScript(commentary, lang);
-      audioBuffer = await textToVoice(spokenScript || commentary, lang);
+    var spokenScript = await generateSpokenScript(commentary, lang);
+    var voiceText = spokenScript || commentary;
+    if (ELEVENLABS_KEY) {
+      audioBuffer = await textToVoiceElevenLabs(voiceText);
+      if (!audioBuffer) console.log('ElevenLabs failed, trying Azure...');
+    }
+    if (!audioBuffer && AZURE_KEY) {
+      audioBuffer = await textToVoice(voiceText, lang);
     }
 
     // Send to all subscribers of this language
