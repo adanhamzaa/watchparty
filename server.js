@@ -272,10 +272,11 @@ async function broadcastToSubscribers(event, matchInfo, homeTeam, awayTeam, fixt
     var sub = subscribers[convId];
     if (!sub.active) continue;
     var shouldNotify = false;
-    if (sub.teams && sub.teams.includes('all')) shouldNotify = true;
-    else if (sub.teams) {
+    if (!sub.teams || sub.teams.length === 0 || sub.teams.includes('all') || sub.teams.includes('all matches')) {
+      shouldNotify = true;
+    } else {
       sub.teams.forEach(function(t) {
-        if (homeTeam.toLowerCase().includes(t.toLowerCase()) || awayTeam.toLowerCase().includes(t.toLowerCase())) shouldNotify = true;
+        if (t && (homeTeam.toLowerCase().includes(t.toLowerCase()) || awayTeam.toLowerCase().includes(t.toLowerCase()))) shouldNotify = true;
       });
     }
     if (shouldNotify) relevantSubs.push({ convId: convId, language: sub.language || 'sheng' });
