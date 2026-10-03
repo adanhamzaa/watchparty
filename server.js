@@ -307,6 +307,113 @@ async function getScoreAfterEvent(fixtureId, homeTeam, awayTeam, untilMinute) {
   } catch(e) { return { homeScore: 0, awayScore: 0 }; }
 }
 
+// ============= SCOREBOARD IMAGE GENERATOR =============
+async function generateScoreboardImage(event, matchInfo, homeScore, awayScore) {
+  try {
+    var canvas = require('canvas');
+    var c = canvas.createCanvas(800, 400);
+    var ctx = c.getContext('2d');
+
+    // Background gradient — dark stadium feel
+    var grad = ctx.createLinearGradient(0, 0, 0, 400);
+    grad.addColorStop(0, '#0a0a1a');
+    grad.addColorStop(1, '#1a1a3e');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 800, 400);
+
+    // Green pitch strip at bottom
+    ctx.fillStyle = '#1a5c2e';
+    ctx.fillRect(0, 340, 800, 60);
+    ctx.fillStyle = '#1e6b35';
+    for (var i = 0; i < 10; i++) {
+      ctx.fillRect(i * 80, 340, 40, 60);
+    }
+
+    // League name
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = 'bold 22px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText((matchInfo.league || 'Football').toUpperCase(), 400, 45);
+
+    // Home team
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 52px Arial';
+    ctx.textAlign = 'right';
+    ctx.fillText(matchInfo.home.toUpperCase(), 290, 160);
+
+    // Away team
+    ctx.textAlign = 'left';
+    ctx.fillText(matchInfo.away.toUpperCase(), 510, 160);
+
+    // Score box background
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.beginPath();
+    ctx.roundRect(310, 100, 180, 90, 12);
+    ctx.fill();
+
+    // Score
+    ctx.fillStyle = '#FFD700';
+    ctx.font = 'bold 72px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(homeScore + '-' + awayScore, 400, 175);
+
+    // Goal event
+    var emoji = event.type === 'Goal' ? '⚽' : '🟥';
+    ctx.fillStyle = '#25D366';
+    ctx.font = 'bold 28px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(emoji + '  ' + event.time + "'  " + (event.player || ''), 400, 240);
+
+    // Divider line
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(100, 260);
+    ctx.lineTo(700, 260);
+    ctx.stroke();
+
+    // WatchParty branding
+    ctx.fillStyle = '#25D366';
+    ctx.font = 'bold 20px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('⚡ WatchParty AI', 400, 300);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.font = '16px Arial';
+    ctx.fillText('Football kwa East Africa', 400, 325);
+
+    return c.toBuffer('image/png');
+  } catch(e) {
+    console.log('Scoreboard image error:', e.message);
+    return null;
+  }
+}
+
+async function sendImageChatwoot(conversationId, imageBuffer, caption) {
+  return new Promise(function(resolve) {
+    var boundary = 'boundary' + Date.now();
+    var captionField = '--' + boundary + '\r\nContent-Disposition: form-data; name="content"\r\n\r\n' + (caption || '') + '\r\n';
+    var header = '--' + boundary + '\r\nContent-Disposition: form-data; name="attachments[]"; filename="scoreboard.png"\r\nContent-Type: image/png\r\n\r\n';
+    var footer = '\r\n--' + boundary + '--\r\n';
+    var body = Buffer.concat([Buffer.from(captionField), Buffer.from(header), imageBuffer, Buffer.from(footer)]);
+    var options = {
+      hostname: CHATWOOT_URL, path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages', method: 'POST',
+      headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length }
+    };
+    var req = https.request(options, function(res) {
+      var d = '';
+      res.on('data', function(c) { d += c; });
+      res.on('end', function() {
+        var ok = res.statusCode >= 200 && res.statusCode < 300;
+        console.log('Scoreboard image sent:', res.statusCode);
+        resolve(ok);
+      });
+    });
+    req.on('error', function(e) { console.log('Image send error:', e.message); resolve(false); });
+    req.write(body); req.end();
+  });
+}
+
 // ============= CHATWOOT =============
 function sendChatwootMessage(conversationId, content) {
   return new Promise(function(resolve) {
@@ -603,16 +710,23 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
     if (event.player) textMsg += event.player + '\n';
     textMsg += '\n' + commentary;
 
-    // STEP 1: Text first — always, verify delivery
+    // STEP 1: Generate scoreboard image + send with text
+    var scoreboardImg = await generateScoreboardImage(event, matchInfo, homeScore, awayScore);
     var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + textCommentary;
     var atLeastOneSent = false;
     for (var i = 0; i < convIds.length; i++) {
-      var sent = await sendChatwootMessage(convIds[i], textMsg2);
+      var sent = false;
+      if (scoreboardImg) {
+        sent = await sendImageChatwoot(convIds[i], scoreboardImg, textMsg2);
+      }
+      if (!sent) {
+        sent = await sendChatwootMessage(convIds[i], textMsg2);
+      }
       if (sent) atLeastOneSent = true;
       await new Promise(function(r) { setTimeout(r, 300); });
     }
     if (!atLeastOneSent) { console.log('All Chatwoot deliveries failed for lang:', lang); continue; }
-    console.log('Text sent in', Date.now()-t0, 'ms for', convIds.length, lang, 'subscribers');
+    console.log('Scoreboard + text sent in', Date.now()-t0, 'ms for', convIds.length, lang, 'subscribers');
 
     // STEP 2: Voice after text — use VOICE script not text script
     var audioBuffer = await textToVoiceElevenLabs(voiceCommentary);
