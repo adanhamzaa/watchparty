@@ -668,7 +668,22 @@ async function pollLiveMatches() {
     if (GOAL_API_KEY) {
       var goalResult = await goalAPI('/fixtures/live');
       if (goalResult && goalResult.data && Array.isArray(goalResult.data)) {
-        goalResult.data.forEach(function(m) {
+        // Filter to popular leagues only — save API quota!
+        var popularLeagues = [
+          'premier league', 'champions league', 'la liga', 'serie a', 'bundesliga',
+          'ligue 1', 'eredivisie', 'primeira liga', 'super lig', 'nations league',
+          'world cup', 'euro', 'copa america', 'africa cup', 'premier league 2',
+          'kenyan premier league', 'tanzanian premier league', 'ugandan premier league'
+        ];
+        var filtered = goalResult.data.filter(function(m) {
+          var league = ((m.league && m.league.name) || '').toLowerCase();
+          return popularLeagues.some(function(pl) { return league.includes(pl); });
+        });
+        // If no popular leagues found use all — but limit to 10
+        var matchesToPoll = filtered.length > 0 ? filtered : goalResult.data.slice(0, 10);
+        console.log('Filtered to', matchesToPoll.length, 'matches from', goalResult.data.length, 'total');
+
+        matchesToPoll.forEach(function(m) {
           var fId = String(m.id);
           currentLiveIds[fId] = true;
           if (!liveMatches[fId]) {
