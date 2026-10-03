@@ -6,6 +6,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "pg": "^8.11.0"
+    "pg": "^8.11.0",
+    "canvas": "^2.11.2"
   }
 }
