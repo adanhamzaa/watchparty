@@ -750,24 +750,41 @@ async function pollMatchEvents(fixtureId) {
 
     // Try GOAL API events first
     if (GOAL_API_KEY && source !== 'api-football') {
-      var goalEvents = await goalAPI('/fixtures/' + fixtureId);
-      if (goalEvents && goalEvents.data && goalEvents.data.events) {
-        rawEvents = goalEvents.data.events.map(function(e) {
-          return {
-            type: e.type === 'goal' ? 'Goal' : (e.type === 'red_card' ? 'Card' : e.type),
-            detail: e.detail || e.type,
-            player: e.player && e.player.name,
-            team: e.team && e.team.name,
-            elapsed: e.minute || 0,
-            extra: e.minuteExtra || 0
-          };
-        });
-        // Check match status
-        if (goalEvents.data.status === 'finished' || goalEvents.data.status === 'FT') {
-          console.log('Match', fixtureId, 'finished (GOAL API)');
-          if (matchPolling && matchPolling[fixtureId]) { delete liveMatches[fixtureId]; delete matchQueues[fixtureId]; }
+      var goalFixture = await goalAPI('/fixtures/' + fixtureId);
+      if (goalFixture && goalFixture.data) {
+        var fd = goalFixture.data;
+        // Check if match finished
+        if (fd.matchStatus === 'FINISHED' || fd.matchStatus === 'FT' || fd.matchStatus === 'ENDED') {
+          console.log('Match', fixtureId, 'finished (GOAL API) — stopping');
+          delete liveMatches[fixtureId]; delete matchQueues[fixtureId];
           return;
         }
+        // Parse events — GOAL API format
+        var goalApiEvents = fd.events || [];
+        rawEvents = goalApiEvents.map(function(e) {
+          // Determine scorer and team
+          var player = e.homeScorer || e.awayScorer || '';
+          var isHome = !!e.homeScorer;
+          var matchInfoLocal = liveMatches[fixtureId] || {};
+          var team = isHome ? matchInfoLocal.home : matchInfoLocal.away;
+          // Parse score from "1 - 1" format
+          var scoreParts = (e.score || '0 - 0').split(' - ');
+          var homeScore = parseInt(scoreParts[0]) || 0;
+          var awayScore = parseInt(scoreParts[1]) || 0;
+          return {
+            type: e.type === 'GOAL' ? 'Goal' : (e.type === 'RED_CARD' ? 'Card' : e.type),
+            detail: e.type,
+            player: player.replace(' (o.g.)', ''),
+            ownGoal: player.includes('(o.g.)'),
+            team: team,
+            elapsed: parseInt(e.time) || 0,
+            extra: 0,
+            score: e.score,
+            homeScore: homeScore,
+            awayScore: awayScore
+          };
+        }).filter(function(e) { return e.type === 'Goal' || e.type === 'Card'; });
+        console.log('GOAL API events found:', rawEvents.length, 'for', fixtureId);
       }
     }
 
