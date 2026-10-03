@@ -16,6 +16,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 // Per-fixture sequential queues
 var matchQueues = {};
+var isPolling = false; // Single polling controller
 
 // ============= DATABASE =============
 async function queryDB(sql, params) {
@@ -67,12 +68,15 @@ async function setupDB() {
 
     // FIX #3: persist API request count across restarts
     await queryDB(`CREATE TABLE IF NOT EXISTS wp_api_usage (
-      id SERIAL PRIMARY KEY,
-      provider VARCHAR(50) NOT NULL,
-      request_count INT DEFAULT 0,
+      provider VARCHAR(50) PRIMARY KEY,
+      request_count INT NOT NULL DEFAULT 0,
       reset_at TIMESTAMP NOT NULL,
+      remaining INT DEFAULT 100,
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
+    await queryDB('ALTER TABLE wp_api_usage ADD COLUMN IF NOT EXISTS remaining INT DEFAULT 100').catch(function(){});
+    // Ensure today's row exists
+    await initAPICounter();
 
     // FIX #4: track video jobs per event
     await queryDB(`CREATE TABLE IF NOT EXISTS wp_video_jobs (
@@ -95,37 +99,68 @@ async function setupDB() {
 }
 
 // ============= FIX #3: Persistent API counter =============
-async function getAPICount() {
+// Get next midnight UTC
+function nextMidnightUTC() {
+  var d = new Date();
+  d.setUTCHours(24, 0, 0, 0);
+  return d;
+}
+
+// Init or reset counter if past reset_at
+async function initAPICounter() {
   try {
-    // Get or create today's counter row aligned to midnight UTC
-    var resetAt = new Date();
-    resetAt.setUTCHours(24, 0, 0, 0);
-    var result = await queryDB(
-      "SELECT id, request_count FROM wp_api_usage WHERE provider='api-football' AND reset_at > NOW() ORDER BY reset_at ASC LIMIT 1"
-    );
-    if (result.rows.length > 0) return parseInt(result.rows[0].request_count) || 0;
-    // Create new counter for today
+    var resetAt = nextMidnightUTC();
     await queryDB(
-      "INSERT INTO wp_api_usage (provider, request_count, reset_at) VALUES ('api-football', 0, $1) ON CONFLICT DO NOTHING",
+      `INSERT INTO wp_api_usage (provider, request_count, remaining, reset_at)
+       VALUES ('api-football', 0, 100, $1)
+       ON CONFLICT (provider) DO UPDATE SET
+         request_count = CASE WHEN wp_api_usage.reset_at <= NOW() THEN 0 ELSE wp_api_usage.request_count END,
+         remaining = CASE WHEN wp_api_usage.reset_at <= NOW() THEN 100 ELSE wp_api_usage.remaining END,
+         reset_at = CASE WHEN wp_api_usage.reset_at <= NOW() THEN $1 ELSE wp_api_usage.reset_at END,
+         updated_at = NOW()`,
       [resetAt]
     );
+    var row = await queryDB("SELECT request_count, remaining, reset_at FROM wp_api_usage WHERE provider='api-football'");
+    if (row.rows.length > 0) {
+      console.log('API counter: ' + row.rows[0].request_count + ' used, ' + row.rows[0].remaining + ' remaining, resets at ' + row.rows[0].reset_at);
+    }
+  } catch(e) { console.log('initAPICounter error:', e.message); }
+}
+
+async function getAPICount() {
+  try {
+    await initAPICounter(); // Auto-reset if new day
+    var result = await queryDB("SELECT request_count, remaining FROM wp_api_usage WHERE provider='api-football'");
+    if (result.rows.length > 0) return parseInt(result.rows[0].request_count) || 0;
     return 0;
   } catch(e) { console.log('getAPICount error:', e.message); return 0; }
 }
 
-async function incrementAPICount() {
+async function incrementAPICount(remainingFromHeader) {
   try {
-    await queryDB(
-      "UPDATE wp_api_usage SET request_count = request_count + 1, updated_at = NOW() WHERE provider='api-football' AND reset_at > NOW()"
-    );
+    var updateRemaining = remainingFromHeader !== undefined ? ', remaining = $1' : '';
+    if (remainingFromHeader !== undefined) {
+      await queryDB(
+        "UPDATE wp_api_usage SET request_count = request_count + 1, remaining = $1, updated_at = NOW() WHERE provider='api-football'",
+        [remainingFromHeader]
+      );
+    } else {
+      await queryDB(
+        "UPDATE wp_api_usage SET request_count = request_count + 1, remaining = GREATEST(remaining - 1, 0), updated_at = NOW() WHERE provider='api-football'"
+      );
+    }
   } catch(e) { console.log('incrementAPICount error:', e.message); }
 }
 
 async function resetAPICount() {
   try {
-    await queryDB("DELETE FROM wp_api_usage WHERE provider='api-football'");
-    console.log('API counter reset!');
-  } catch(e) {}
+    var resetAt = nextMidnightUTC();
+    await queryDB(
+      "UPDATE wp_api_usage SET request_count=0, remaining=100, reset_at=$1, updated_at=NOW() WHERE provider='api-football'",
+      [resetAt]
+    );
+    console.log('API counter manually reset!');
+  } catch(e) { console.log('resetAPICount error:', e.message); }
 }
 
 // ============= API-FOOTBALL =============
@@ -142,8 +177,21 @@ async function footballAPI(path) {
       res.on('data', function(c) { d += c; });
       res.on('end', function() {
         try {
+          // Read actual remaining quota from API-Football headers
+          var remaining = res.headers['x-ratelimit-requests-remaining'];
+          var limit = res.headers['x-ratelimit-requests-limit'];
+          if (remaining !== undefined) {
+            console.log('API-Football quota: ' + remaining + ' remaining of ' + limit);
+            incrementAPICount(parseInt(remaining));
+          } else {
+            incrementAPICount();
+          }
           var result = JSON.parse(d);
-          if (result.errors && result.errors.requests) { console.log('API-Football daily limit hit!'); resolve(null); return; }
+          if (result.errors && result.errors.requests) {
+            console.log('API-Football daily limit hit!');
+            incrementAPICount(0); // Mark as exhausted
+            resolve(null); return;
+          }
           resolve(result);
         } catch(e) { resolve(null); }
       });
@@ -580,6 +628,8 @@ function queueEvent(event, matchInfo, fixtureId, eventId) {
 var liveMatches = {};
 
 async function pollLiveMatches() {
+  if (isPolling) { console.log('Poll already running — skipping'); return; }
+  isPolling = true;
   try {
     var result = await footballAPI('/fixtures?live=all');
     if (!result || !result.response) return;
@@ -614,6 +664,7 @@ async function pollLiveMatches() {
       await new Promise(function(r) { setTimeout(r, 500); });
     }
   } catch(e) { console.log('Poll live error:', e.message); }
+  finally { isPolling = false; }
 }
 
 async function pollMatchEvents(fixtureId) {
