@@ -1,5 +1,5 @@
 const https = require('https');
-const http = require('http'); 
+const http = require('http');
 const { Client } = require('pg');
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
@@ -97,20 +97,34 @@ async function setupDB() {
 // ============= FIX #3: Persistent API counter =============
 async function getAPICount() {
   try {
-    var now = new Date();
-    var result = await queryDB("SELECT request_count, reset_at FROM wp_api_usage WHERE provider='api-football' AND reset_at > NOW() ORDER BY id DESC LIMIT 1");
-    if (result.rows.length > 0) return parseInt(result.rows[0].request_count);
-    // No valid row — reset at next midnight UTC (API-Football resets at 00:00 UTC)
+    // Get or create today's counter row aligned to midnight UTC
     var resetAt = new Date();
-    resetAt.setUTCHours(24, 0, 0, 0); // Next midnight UTC
-    await queryDB("INSERT INTO wp_api_usage (provider, request_count, reset_at) VALUES ('api-football', 0, $1)", [resetAt]);
+    resetAt.setUTCHours(24, 0, 0, 0);
+    var result = await queryDB(
+      "SELECT id, request_count FROM wp_api_usage WHERE provider='api-football' AND reset_at > NOW() ORDER BY reset_at ASC LIMIT 1"
+    );
+    if (result.rows.length > 0) return parseInt(result.rows[0].request_count) || 0;
+    // Create new counter for today
+    await queryDB(
+      "INSERT INTO wp_api_usage (provider, request_count, reset_at) VALUES ('api-football', 0, $1) ON CONFLICT DO NOTHING",
+      [resetAt]
+    );
     return 0;
-  } catch(e) { return 0; }
+  } catch(e) { console.log('getAPICount error:', e.message); return 0; }
 }
 
 async function incrementAPICount() {
   try {
-    await queryDB("UPDATE wp_api_usage SET request_count = request_count + 1, updated_at = NOW() WHERE provider='api-football' AND reset_at > NOW()");
+    await queryDB(
+      "UPDATE wp_api_usage SET request_count = request_count + 1, updated_at = NOW() WHERE provider='api-football' AND reset_at > NOW()"
+    );
+  } catch(e) { console.log('incrementAPICount error:', e.message); }
+}
+
+async function resetAPICount() {
+  try {
+    await queryDB("DELETE FROM wp_api_usage WHERE provider='api-football'");
+    console.log('API counter reset!');
   } catch(e) {}
 }
 
@@ -693,6 +707,7 @@ var server = http.createServer(function(req, res) {
     return;
   }
   if (req.method === 'GET' && req.url === '/poll-now') { res.writeHead(200); res.end('Polling!'); pollLiveMatches(); return; }
+  if (req.method === 'GET' && req.url === '/reset-api-counter') { res.writeHead(200); res.end('Reset!'); resetAPICount(); return; }
   if (req.method === 'POST' && req.url === '/webhook') {
     var body = '';
     req.on('data', function(c) { body += c; });
