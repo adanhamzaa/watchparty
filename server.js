@@ -386,7 +386,7 @@ function textToVoiceElevenLabs(text) {
     var cleanText = text.replace(/[^\x00-\x7F]/g, '').replace(/\*\*/g, '').replace(/#\w+/g, '').trim();
     if (cleanText.length > 250) cleanText = cleanText.substring(0, 250);
     if (!cleanText || cleanText.length < 5) { resolve(null); return; }
-    var ttsPayload = { text: cleanText, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.3, use_speaker_boost: true } };
+    var ttsPayload = { text: cleanText, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.45, similarity_boost: 0.80, style: 0.00, speed: 0.88, use_speaker_boost: true } };
     if (elevenLabsDictId) { ttsPayload.pronunciation_dictionary_locators = [{ pronunciation_dictionary_id: elevenLabsDictId, version_id: 'latest' }]; }
     var body = JSON.stringify(ttsPayload);
     var options = { hostname: 'api.elevenlabs.io', path: '/v1/text-to-speech/' + ELEVENLABS_VOICE_ID, method: 'POST', headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg', 'Content-Length': Buffer.byteLength(body) } };
@@ -421,28 +421,17 @@ async function generateCommentary(eventContext, language, recentCommentary) {
     ? '\n\nPrevious reactions you sent (AVOID repeating same words/style):\n' + recentCommentary.join('\n')
     : '';
 
-  var prompt = `WATCHPARTY REACTION ENGINE — WatchParty Kenyan football commentary
-
-VERIFIED MATCH FACTS ONLY (use these, do not invent anything else):
-Competition: ${eventContext.competition}
-${eventContext.home} ${eventContext.homeScore}-${eventContext.awayScore} ${eventContext.away}
-Event: ${eventContext.eventType} — ${eventContext.scorer} (${eventContext.minute}')
-Situation: ${eventContext.situation}
-${historyNote}
-
-YOUR RULES:
-1. React to the SITUATION and SCORE, not just the goal
-2. Maximum 2 short sentences — aim for 5-12 seconds when spoken
-3. Vary your opening naturally: Yoh! / Weh! / Nah bro! / Eeh bana! / Aii! / Jameni! / Broooo! / Again?! / FINALLY!
-4. NEVER invent: shot quality, goalkeeper, assists, tactics, what happened before or after
-5. NEVER say "mchezo unaenda interesting" or "game imebadilika kabisa" or "hii game ni ya moyo"
-6. Use the actual score naturally
-7. Natural Kenyan English + Swahili/Sheng — do not force slang
-8. 0-2 emojis only
-9. Language: ${language}
-10. Sound like a real fan texting a friend — NOT formal commentary
-
-Return ONLY the reaction text. Nothing else.`;
+  var prompt = 'WATCHPARTY REACTION ENGINE\n\n' +
+    'MATCH FACTS:\n' +
+    'Competition: ' + eventContext.competition + '\n' +
+    eventContext.home + ' ' + eventContext.homeScore + '-' + eventContext.awayScore + ' ' + eventContext.away + '\n' +
+    'Event: ' + eventContext.eventType + ' - ' + eventContext.scorer + ' (' + eventContext.minute + 'min)\n' +
+    'Situation: ' + eventContext.situation + '\n' +
+    historyNote + '\n\n' +
+    'Generate TWO versions:\n' +
+    'TEXT: [1-2 sentences, include score, 0-2 emojis, natural Sheng/Swahili/English mix]\n' +
+    'VOICE: [7-9 seconds spoken, REACTION only - text already shows score, write numbers as words like one-nil, add SSML breaks like <break time=\"0.35s\" /> between sentences, no emojis]\n\n' +
+    'RULES: Vary opening: Yo! Weh! Aii! Nah bro! NEVER invent goalkeeper/tactics. Language: ' + language;
 
   var body = JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 100, messages: [{ role: 'user', content: prompt }] });
   var options = { hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } };
@@ -615,18 +604,19 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
     textMsg += '\n' + commentary;
 
     // STEP 1: Text first — always, verify delivery
+    var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + textCommentary;
     var atLeastOneSent = false;
     for (var i = 0; i < convIds.length; i++) {
-      var sent = await sendChatwootMessage(convIds[i], textMsg);
+      var sent = await sendChatwootMessage(convIds[i], textMsg2);
       if (sent) atLeastOneSent = true;
       await new Promise(function(r) { setTimeout(r, 300); });
     }
     if (!atLeastOneSent) { console.log('All Chatwoot deliveries failed for lang:', lang); continue; }
     console.log('Text sent in', Date.now()-t0, 'ms for', convIds.length, lang, 'subscribers');
 
-    // STEP 2: Voice after text — non-blocking per language
-    var audioBuffer = await textToVoiceElevenLabs(commentary);
-    if (!audioBuffer) audioBuffer = await textToVoiceAzure(commentary);
+    // STEP 2: Voice after text — use VOICE script not text script
+    var audioBuffer = await textToVoiceElevenLabs(voiceCommentary);
+    if (!audioBuffer) audioBuffer = await textToVoiceAzure(voiceCommentary);
     if (audioBuffer) {
       for (var i = 0; i < convIds.length; i++) {
         await sendVoiceChatwoot(convIds[i], audioBuffer);
@@ -842,6 +832,9 @@ async function handleIncomingWhatsApp(payload) {
     var senderName = (payload.sender && payload.sender.name) || 'Fan';
     if (!message || !conversationId) return;
     console.log('WatchParty from', senderName, ':', message);
+
+    // Only handle WatchParty commands — ignore AfriDesk responses
+    if (payload.sender && payload.sender.type === 'agent_bot') return;
 
     if (message.startsWith('subscribe') || message.startsWith('watchparty')) {
       var parts = message.replace('watchparty', '').replace('subscribe', '').trim().split(' ');
