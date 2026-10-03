@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 const AZURE_KEY = process.env.AZURE_SPEECH_KEY;
 const AZURE_REGION = process.env.AZURE_SPEECH_REGION || 'eastus';
 const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
+const GOAL_API_KEY = process.env.GOAL_API_KEY;
 const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'p0TiOqMl1M1IbvZ0ke9s';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -96,6 +97,33 @@ async function setupDB() {
 
     console.log('WatchParty DB ready!');
   } catch(e) { console.log('DB setup error:', e.message); }
+}
+
+// ============= GOAL API (1000 requests/day free) =============
+function goalAPI(path) {
+  return new Promise(function(resolve) {
+    if (!GOAL_API_KEY) { resolve(null); return; }
+    var options = {
+      hostname: 'api.goal-api.com',
+      path: '/v1' + path,
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + GOAL_API_KEY, 'Content-Type': 'application/json' }
+    };
+    var req = https.request(options, function(res) {
+      var d = '';
+      res.on('data', function(c) { d += c; });
+      res.on('end', function() {
+        try {
+          var result = JSON.parse(d);
+          console.log('GOAL API:', path, '| Status:', res.statusCode);
+          resolve(result);
+        } catch(e) { resolve(null); }
+      });
+    });
+    req.on('error', function(e) { console.log('GOAL API error:', e.message); resolve(null); });
+    setTimeout(function() { req.destroy(); resolve(null); }, 10000);
+    req.end();
+  });
 }
 
 // ============= FIX #3: Persistent API counter =============
@@ -634,25 +662,52 @@ async function pollLiveMatches() {
   if (isPolling) { console.log('Poll already running — skipping'); return; }
   isPolling = true;
   try {
-    var result = await footballAPI('/fixtures?live=all');
-    if (!result || !result.response) return;
-
     var currentLiveIds = {};
-    result.response.forEach(function(m) {
-      var fId = String(m.fixture.id);
-      currentLiveIds[fId] = true;
-      if (!liveMatches[fId]) {
-        liveMatches[fId] = {
-          home: m.teams.home.name, away: m.teams.away.name,
-          league: m.league.name, country: m.league.country,
-          apiHomeScore: m.goals.home || 0, apiAwayScore: m.goals.away || 0
-        };
-        queryDB(`INSERT INTO wp_matches (fixture_id, league_name, country, home_team, away_team, status, home_score, away_score)
-          VALUES ($1,$2,$3,$4,$5,'live',$6,$7)
-          ON CONFLICT (fixture_id) DO UPDATE SET status='live', home_score=$6, away_score=$7, last_checked=NOW()`,
-          [fId, m.league.name, m.league.country, m.teams.home.name, m.teams.away.name, m.goals.home || 0, m.goals.away || 0]).catch(function(){});
+
+    // GOAL API first — 1000 requests/day free
+    if (GOAL_API_KEY) {
+      var goalResult = await goalAPI('/fixtures/live');
+      if (goalResult && goalResult.data && Array.isArray(goalResult.data)) {
+        goalResult.data.forEach(function(m) {
+          var fId = String(m.id);
+          currentLiveIds[fId] = true;
+          if (!liveMatches[fId]) {
+            liveMatches[fId] = {
+              home: (m.homeTeam && m.homeTeam.name) || 'Home',
+              away: (m.awayTeam && m.awayTeam.name) || 'Away',
+              league: (m.league && m.league.name) || 'Football',
+              country: (m.league && m.league.country) || '',
+              source: 'goal-api'
+            };
+            queryDB('INSERT INTO wp_matches (fixture_id, league_name, country, home_team, away_team, status, home_score, away_score) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (fixture_id) DO UPDATE SET status=$6, home_score=$7, away_score=$8, last_checked=NOW()',
+              [fId, liveMatches[fId].league, liveMatches[fId].country, liveMatches[fId].home, liveMatches[fId].away, 'live',
+               (m.score && m.score.home) || 0, (m.score && m.score.away) || 0]).catch(function(){});
+          }
+        });
+        console.log('GOAL API live matches:', Object.keys(currentLiveIds).length);
       }
-    });
+    }
+
+    // API-Football fallback — only if GOAL API returns nothing
+    if (Object.keys(currentLiveIds).length === 0 && FOOTBALL_API_KEY) {
+      var afResult = await footballAPI('/fixtures?live=all');
+      if (afResult && afResult.response) {
+        afResult.response.forEach(function(m) {
+          var fId = String(m.fixture.id);
+          currentLiveIds[fId] = true;
+          if (!liveMatches[fId]) {
+            liveMatches[fId] = {
+              home: m.teams.home.name, away: m.teams.away.name,
+              league: m.league.name, country: m.league.country,
+              source: 'api-football'
+            };
+            queryDB('INSERT INTO wp_matches (fixture_id, league_name, country, home_team, away_team, status, home_score, away_score) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (fixture_id) DO UPDATE SET status=$6, home_score=$7, away_score=$8, last_checked=NOW()',
+              [fId, m.league.name, m.league.country, m.teams.home.name, m.teams.away.name, 'live', m.goals.home || 0, m.goals.away || 0]).catch(function(){});
+          }
+        });
+        console.log('API-Football fallback live matches:', Object.keys(currentLiveIds).length);
+      }
+    }
 
     // Clean finished matches
     Object.keys(liveMatches).forEach(function(fId) {
@@ -675,35 +730,69 @@ async function pollMatchEvents(fixtureId) {
     var matchInfo = liveMatches[fixtureId];
     if (!matchInfo) return;
 
-    var eventsResult = await footballAPI('/fixtures/events?fixture=' + fixtureId);
-    if (!eventsResult || !eventsResult.response) return;
+    var rawEvents = [];
+    var source = matchInfo.source || 'goal-api';
+
+    // Try GOAL API events first
+    if (GOAL_API_KEY && source !== 'api-football') {
+      var goalEvents = await goalAPI('/fixtures/' + fixtureId);
+      if (goalEvents && goalEvents.data && goalEvents.data.events) {
+        rawEvents = goalEvents.data.events.map(function(e) {
+          return {
+            type: e.type === 'goal' ? 'Goal' : (e.type === 'red_card' ? 'Card' : e.type),
+            detail: e.detail || e.type,
+            player: e.player && e.player.name,
+            team: e.team && e.team.name,
+            elapsed: e.minute || 0,
+            extra: e.minuteExtra || 0
+          };
+        });
+        // Check match status
+        if (goalEvents.data.status === 'finished' || goalEvents.data.status === 'FT') {
+          console.log('Match', fixtureId, 'finished (GOAL API)');
+          if (matchPolling && matchPolling[fixtureId]) { delete liveMatches[fixtureId]; delete matchQueues[fixtureId]; }
+          return;
+        }
+      }
+    }
+
+    // Fallback to API-Football
+    if (rawEvents.length === 0 && FOOTBALL_API_KEY) {
+      var eventsResult = await footballAPI('/fixtures/events?fixture=' + fixtureId);
+      if (eventsResult && eventsResult.response) {
+        rawEvents = eventsResult.response.map(function(e) {
+          return {
+            type: e.type === 'Goal' ? 'Goal' : (e.detail === 'Red Card' ? 'Card' : e.type),
+            detail: e.detail,
+            player: e.player && e.player.name,
+            team: e.team && e.team.name,
+            elapsed: e.time && e.time.elapsed || 0,
+            extra: e.time && e.time.extra || 0
+          };
+        });
+      }
+    }
 
     // Sort chronologically
-    var events = eventsResult.response
-      .filter(function(e) { return e.type === 'Goal' || (e.type === 'Card' && e.detail === 'Red Card'); })
+    var events = rawEvents
+      .filter(function(e) { return e.type === 'Goal' || (e.type === 'Card' && (e.detail === 'Red Card' || e.detail === 'red_card')); })
       .sort(function(a, b) {
-        var aMin = (a.time.elapsed || 0) + (a.time.extra || 0) * 0.1;
-        var bMin = (b.time.elapsed || 0) + (b.time.extra || 0) * 0.1;
-        return aMin - bMin;
+        return (a.elapsed + a.extra * 0.1) - (b.elapsed + b.extra * 0.1);
       });
 
     for (var i = 0; i < events.length; i++) {
       var e = events[i];
-      var playerId = (e.player && e.player.id) || 0;
-      var teamId = (e.team && e.team.id) || 0;
-      var extra = e.time.extra || 0;
-      var eventKey = fixtureId + '-' + e.time.elapsed + '-' + extra + '-' + teamId + '-' + playerId + '-' + e.type + '-' + (e.detail || '');
+      var eventKey = fixtureId + '-' + e.elapsed + '-' + e.extra + '-' + (e.team || '') + '-' + (e.player || '') + '-' + e.type;
 
-      // FIX #2: Atomic insert — only queue if new
-      var eventId = await tryInsertEvent(eventKey, fixtureId, e.time.elapsed, e.type, e.player && e.player.name, e.team && e.team.name);
-      if (!eventId) continue; // Already processed
+      var eventId = await tryInsertEvent(eventKey, fixtureId, e.elapsed, e.type, e.player, e.team);
+      if (!eventId) continue;
 
       var event = {
-        type: e.type === 'Goal' ? 'Goal' : 'Card',
+        type: e.type,
         detail: e.detail,
-        player: e.player && e.player.name,
-        team: e.team && e.team.name,
-        time: e.time.elapsed + (extra > 0 ? '+' + extra : '')
+        player: e.player,
+        team: e.team,
+        time: e.elapsed + (e.extra > 0 ? '+' + e.extra : '')
       };
 
       console.log('NEW EVENT queued:', JSON.stringify(event), 'Match:', matchInfo.home, 'vs', matchInfo.away);
