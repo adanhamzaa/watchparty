@@ -1,5 +1,5 @@
 const https = require('https');
-const http = require('http'); 
+const http = require('http');
 const { Client } = require('pg');
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
@@ -167,9 +167,12 @@ async function resetAPICount() {
 async function footballAPI(path) {
   if (!FOOTBALL_API_KEY) return null;
   var count = await getAPICount();
-  if (count >= 90) { console.log('API-Football limit approaching — conserving! Count:', count); return null; }
-  await incrementAPICount();
-  console.log('API-Football request #' + (count+1) + ': ' + path);
+  // Use actual remaining from API-Football headers (stored in DB)
+  var usageRow = null;
+  try { usageRow = await queryDB("SELECT remaining, request_count FROM wp_api_usage WHERE provider='api-football'"); } catch(e) {}
+  var remaining = usageRow && usageRow.rows.length > 0 ? parseInt(usageRow.rows[0].remaining) : (100 - count);
+  if (remaining <= 5) { console.log('API-Football limit approaching — conserving! Remaining:', remaining); return null; }
+  console.log('API-Football request #' + (count+1) + ' (' + remaining + ' remaining): ' + path);
   return new Promise(function(resolve) {
     var options = { hostname: 'v3.football.api-sports.io', path: path, method: 'GET', headers: { 'x-apisports-key': FOOTBALL_API_KEY } };
     var req = https.request(options, function(res) {
