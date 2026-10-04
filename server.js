@@ -692,23 +692,16 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
     if (event.player) textMsg += event.player + '\n';
     textMsg += '\n' + commentary;
 
-    // STEP 1: Generate scoreboard image + send with text
-    var scoreboardSvg = await generateScoreboardSVG(event, matchInfo, homeScore, awayScore);
+    // STEP 1: Send text alert immediately
     var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + commentary;
     var atLeastOneSent = false;
     for (var i = 0; i < convIds.length; i++) {
-      var sent = false;
-      if (scoreboardSvg) {
-        sent = await sendSVGChatwoot(convIds[i], scoreboardSvg, textMsg2);
-      }
-      if (!sent) {
-        sent = await sendChatwootMessage(convIds[i], textMsg2);
-      }
+      var sent = await sendChatwootMessage(convIds[i], textMsg2);
       if (sent) atLeastOneSent = true;
       await new Promise(function(r) { setTimeout(r, 300); });
     }
     if (!atLeastOneSent) { console.log('All Chatwoot deliveries failed for lang:', lang); continue; }
-    console.log('Scoreboard + text sent in', Date.now()-t0, 'ms for', convIds.length, lang, 'subscribers');
+    console.log('Text sent in', Date.now()-t0, 'ms for', convIds.length, lang, 'subscribers');
 
     // STEP 2: Voice after text — use VOICE script not text script
     var audioBuffer = await textToVoiceElevenLabs(commentary);
@@ -991,7 +984,7 @@ server.listen(PORT, async function() {
   // FIX 1: Recover pending events from before crash
   setTimeout(async function() {
     try {
-      var pending = await queryDB("SELECT * FROM wp_processed_events WHERE status='pending' AND processed_at > NOW() - INTERVAL '2 hours'");
+      var pending = await queryDB("SELECT * FROM wp_processed_events WHERE status='pending' AND processed_at > NOW() - INTERVAL '30 minutes'");
       if (pending.rows.length > 0) {
         console.log('Recovering', pending.rows.length, 'pending events from crash...');
         for (var i = 0; i < pending.rows.length; i++) {
