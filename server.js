@@ -669,7 +669,7 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
   // Group by language
   var byLang = {};
   relevantSubs.forEach(function(s) {
-    var lang = s.language || 'sheng';
+    var lang = 'english';
     if (!byLang[lang]) byLang[lang] = [];
     byLang[lang].push(s.conversation_id);
   });
@@ -690,10 +690,10 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
     textMsg += emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n';
     textMsg += matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n';
     if (event.player) textMsg += event.player + '\n';
-    textMsg += '\n' + commentary;
+    textMsg += '\n' + textVersion;
 
     // STEP 1: Send text alert immediately
-    var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + commentary;
+    var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + textVersion;
     var atLeastOneSent = false;
     for (var i = 0; i < convIds.length; i++) {
       var sent = await sendChatwootMessage(convIds[i], textMsg2);
@@ -704,8 +704,8 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
     console.log('Text sent in', Date.now()-t0, 'ms for', convIds.length, lang, 'subscribers');
 
     // STEP 2: Voice after text — use VOICE script not text script
-    var audioBuffer = await textToVoiceElevenLabs(commentary);
-    if (!audioBuffer) audioBuffer = await textToVoiceAzure(commentary);
+    var audioBuffer = await textToVoiceElevenLabs(voiceVersion);
+    if (!audioBuffer) audioBuffer = await textToVoiceAzure(voiceVersion);
     if (audioBuffer) {
       for (var i = 0; i < convIds.length; i++) {
         await sendVoiceChatwoot(convIds[i], audioBuffer);
@@ -747,20 +747,35 @@ async function pollLiveMatches() {
     if (GOAL_API_KEY) {
       var goalResult = await goalAPI('/fixtures/live');
       if (goalResult && goalResult.data && Array.isArray(goalResult.data)) {
-        // Filter to popular leagues only — save API quota!
-        var popularLeagues = [
-          'premier league', 'champions league', 'la liga', 'serie a', 'bundesliga',
-          'ligue 1', 'eredivisie', 'primeira liga', 'super lig', 'nations league',
-          'world cup', 'euro', 'copa america', 'africa cup', 'premier league 2',
-          'kenyan premier league', 'tanzanian premier league', 'ugandan premier league'
+        // Big leagues only — no women's, no lower divisions
+        var bigLeagues = [
+          'premier league',
+          'fa cup',
+          'carabao cup',
+          'champions league',
+          'europa league',
+          'conference league',
+          'nations league',
+          'international friendlies'
         ];
+        // Only Nations League A and B — not C and D
+        var excludeLeagues = ['league c', 'league d', 'league c -', 'league d -'];
+        var womenKeywords = ['women', 'woman', 'frauen', 'feminine', 'femenina', 'feminin', ' w ', ' w.', 'wsl', 'nwsl', 'female'];
         var filtered = goalResult.data.filter(function(m) {
           var league = ((m.league && m.league.name) || '').toLowerCase();
-          return popularLeagues.some(function(pl) { return league.includes(pl); });
+          var home = ((m.homeTeam && m.homeTeam.name) || '').toLowerCase();
+          var away = ((m.awayTeam && m.awayTeam.name) || '').toLowerCase();
+          // Exclude women's leagues
+          var isWomen = womenKeywords.some(function(w) { return league.includes(w) || home.endsWith(' w') || away.endsWith(' w'); });
+          if (isWomen) return false;
+          // Exclude Nations League C and D
+          var isLowNations = excludeLeagues.some(function(ex) { return league.includes(ex); });
+          if (isLowNations) return false;
+          // Include only big leagues
+          return bigLeagues.some(function(bl) { return league.includes(bl); });
         });
-        // If no popular leagues found use all — but limit to 10
-        var matchesToPoll = filtered.length > 0 ? filtered : goalResult.data.slice(0, 10);
-        console.log('Filtered to', matchesToPoll.length, 'matches from', goalResult.data.length, 'total');
+        var matchesToPoll = filtered.length > 0 ? filtered : [];
+        console.log('Filtered to', matchesToPoll.length, 'big league matches from', goalResult.data.length, 'total');
 
         matchesToPoll.forEach(function(m) {
           var fId = String(m.id);
@@ -929,7 +944,7 @@ async function handleIncomingWhatsApp(payload) {
       var parts = message.replace('watchparty', '').replace('subscribe', '').trim().split(' ');
       var team = parts[0] || 'all';
       var lang = (parts[1] || 'sheng').toLowerCase();
-      if (!['sheng','swahili','somali','english'].includes(lang)) lang = 'sheng';
+      lang = 'english'; // English only
       await saveSubscriber(conversationId, lang, team);
       var teamDisplay = (team === 'all') ? 'ALL matches' : team;
       var msg = lang === 'english'
@@ -984,7 +999,7 @@ server.listen(PORT, async function() {
   // FIX 1: Recover pending events from before crash
   setTimeout(async function() {
     try {
-      var pending = await queryDB("SELECT * FROM wp_processed_events WHERE status='pending' AND processed_at > NOW() - INTERVAL '30 minutes'");
+      var pending = await queryDB("SELECT pe.* FROM wp_processed_events pe WHERE pe.status='pending' AND pe.processed_at > NOW() - INTERVAL '20 minutes' LIMIT 5");
       if (pending.rows.length > 0) {
         console.log('Recovering', pending.rows.length, 'pending events from crash...');
         for (var i = 0; i < pending.rows.length; i++) {
