@@ -307,89 +307,71 @@ async function getScoreAfterEvent(fixtureId, homeTeam, awayTeam, untilMinute) {
   } catch(e) { return { homeScore: 0, awayScore: 0 }; }
 }
 
-// ============= SCOREBOARD IMAGE GENERATOR =============
-async function generateScoreboardImage(event, matchInfo, homeScore, awayScore) {
+// ============= SCOREBOARD SVG GENERATOR =============
+function generateScoreboardSVG(event, matchInfo, homeScore, awayScore) {
   try {
-    var canvas = require('canvas');
-    var c = canvas.createCanvas(800, 400);
-    var ctx = c.getContext('2d');
+    var league = (matchInfo.league || 'Football').toUpperCase();
+    var home = (matchInfo.home || '').toUpperCase();
+    var away = (matchInfo.away || '').toUpperCase();
+    var score = homeScore + ' - ' + awayScore;
+    var player = event.player || '';
+    var minute = event.time || '?';
+    var eventEmoji = event.type === 'Goal' ? 'GOAL' : 'RED CARD';
 
-    // Background gradient — dark stadium feel
-    var grad = ctx.createLinearGradient(0, 0, 0, 400);
-    grad.addColorStop(0, '#0a0a1a');
-    grad.addColorStop(1, '#1a1a3e');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, 800, 400);
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400">' +
+      '<defs>' +
+      '<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0%" stop-color="#0a0a1a"/>' +
+      '<stop offset="100%" stop-color="#1a1a3e"/>' +
+      '</linearGradient>' +
+      '</defs>' +
+      '<rect width="800" height="400" fill="url(#bg)"/>' +
+      '<rect y="340" width="800" height="60" fill="#1a5c2e"/>' +
+      '<rect x="0" y="340" width="80" height="60" fill="#1e6b35"/>' +
+      '<rect x="160" y="340" width="80" height="60" fill="#1e6b35"/>' +
+      '<rect x="320" y="340" width="80" height="60" fill="#1e6b35"/>' +
+      '<rect x="480" y="340" width="80" height="60" fill="#1e6b35"/>' +
+      '<rect x="640" y="340" width="80" height="60" fill="#1e6b35"/>' +
+      '<text x="400" y="45" text-anchor="middle" font-family="Arial" font-size="20" font-weight="bold" fill="rgba(255,255,255,0.6)">' + league + '</text>' +
+      '<text x="270" y="155" text-anchor="end" font-family="Arial" font-size="40" font-weight="bold" fill="white">' + home + '</text>' +
+      '<text x="530" y="155" text-anchor="start" font-family="Arial" font-size="40" font-weight="bold" fill="white">' + away + '</text>' +
+      '<rect x="310" y="100" width="180" height="80" rx="12" fill="rgba(255,255,255,0.1)"/>' +
+      '<text x="400" y="165" text-anchor="middle" font-family="Arial" font-size="56" font-weight="bold" fill="#FFD700">' + score + '</text>' +
+      '<text x="400" y="220" text-anchor="middle" font-family="Arial" font-size="22" fill="#25D366">⚽ ' + minute + "' " + player + '</text>' +
+      '<line x1="100" y1="245" x2="700" y2="245" stroke="rgba(255,255,255,0.2)" stroke-width="1"/>' +
+      '<text x="400" y="285" text-anchor="middle" font-family="Arial" font-size="18" font-weight="bold" fill="#25D366">⚡ WatchParty AI</text>' +
+      '<text x="400" y="315" text-anchor="middle" font-family="Arial" font-size="14" fill="rgba(255,255,255,0.4)">Football kwa East Africa</text>' +
+      '</svg>';
 
-    // Green pitch strip at bottom
-    ctx.fillStyle = '#1a5c2e';
-    ctx.fillRect(0, 340, 800, 60);
-    ctx.fillStyle = '#1e6b35';
-    for (var i = 0; i < 10; i++) {
-      ctx.fillRect(i * 80, 340, 40, 60);
-    }
-
-    // League name
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.font = 'bold 22px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText((matchInfo.league || 'Football').toUpperCase(), 400, 45);
-
-    // Home team
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 52px Arial';
-    ctx.textAlign = 'right';
-    ctx.fillText(matchInfo.home.toUpperCase(), 290, 160);
-
-    // Away team
-    ctx.textAlign = 'left';
-    ctx.fillText(matchInfo.away.toUpperCase(), 510, 160);
-
-    // Score box background
-    ctx.fillStyle = 'rgba(255,255,255,0.1)';
-    ctx.beginPath();
-    ctx.roundRect(310, 100, 180, 90, 12);
-    ctx.fill();
-
-    // Score
-    ctx.fillStyle = '#FFD700';
-    ctx.font = 'bold 72px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText(homeScore + '-' + awayScore, 400, 175);
-
-    // Goal event
-    var emoji = event.type === 'Goal' ? '⚽' : '🟥';
-    ctx.fillStyle = '#25D366';
-    ctx.font = 'bold 28px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText(emoji + '  ' + event.time + "'  " + (event.player || ''), 400, 240);
-
-    // Divider line
-    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(100, 260);
-    ctx.lineTo(700, 260);
-    ctx.stroke();
-
-    // WatchParty branding
-    ctx.fillStyle = '#25D366';
-    ctx.font = 'bold 20px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText('⚡ WatchParty AI', 400, 300);
-
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    ctx.font = '16px Arial';
-    ctx.fillText('Football kwa East Africa', 400, 325);
-
-    return c.toBuffer('image/png');
+    return Buffer.from(svg);
   } catch(e) {
-    console.log('Scoreboard image error:', e.message);
+    console.log('SVG error:', e.message);
     return null;
   }
 }
 
-async function sendImageChatwoot(conversationId, imageBuffer, caption) {
+async function sendSVGChatwoot(conversationId, svgBuffer, caption) {
+  return new Promise(function(resolve) {
+    var boundary = 'boundary' + Date.now();
+    var CRLF = '\r\n';
+    var captionPart = '--' + boundary + CRLF + 'Content-Disposition: form-data; name="content"' + CRLF + CRLF + (caption || '') + CRLF;
+    var filePart = '--' + boundary + CRLF + 'Content-Disposition: form-data; name="attachments[]"; filename="scoreboard.svg"' + CRLF + 'Content-Type: image/svg+xml' + CRLF + CRLF;
+    var endPart = CRLF + '--' + boundary + '--' + CRLF;
+    var body = Buffer.concat([Buffer.from(captionPart), Buffer.from(filePart), svgBuffer, Buffer.from(endPart)]);
+    var options = {
+      hostname: CHATWOOT_URL, path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages', method: 'POST',
+      headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length }
+    };
+    var req = https.request(options, function(res) {
+      var d = ''; res.on('data', function(c) { d += c; });
+      res.on('end', function() { resolve(res.statusCode >= 200 && res.statusCode < 300); });
+    });
+    req.on('error', function() { resolve(false); });
+    req.write(body); req.end();
+  });
+}
+
+async function sendSVGChatwoot(conversationId, imageBuffer, caption) {
   return new Promise(function(resolve) {
     var boundary = 'boundary' + Date.now();
     var captionField = '--' + boundary + '\r\nContent-Disposition: form-data; name="content"\r\n\r\n' + (caption || '') + '\r\n';
@@ -711,13 +693,13 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
     textMsg += '\n' + commentary;
 
     // STEP 1: Generate scoreboard image + send with text
-    var scoreboardImg = await generateScoreboardImage(event, matchInfo, homeScore, awayScore);
+    var scoreboardSvg = await generateScoreboardSVG(event, matchInfo, homeScore, awayScore);
     var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + textCommentary;
     var atLeastOneSent = false;
     for (var i = 0; i < convIds.length; i++) {
       var sent = false;
-      if (scoreboardImg) {
-        sent = await sendImageChatwoot(convIds[i], scoreboardImg, textMsg2);
+      if (scoreboardSvg) {
+        sent = await sendSVGChatwoot(convIds[i], scoreboardSvg, textMsg2);
       }
       if (!sent) {
         sent = await sendChatwootMessage(convIds[i], textMsg2);
