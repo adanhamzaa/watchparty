@@ -694,7 +694,7 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
 
     // STEP 1: Generate scoreboard image + send with text
     var scoreboardSvg = await generateScoreboardSVG(event, matchInfo, homeScore, awayScore);
-    var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + textCommentary;
+    var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + commentary;
     var atLeastOneSent = false;
     for (var i = 0; i < convIds.length; i++) {
       var sent = false;
@@ -711,8 +711,8 @@ async function processEvent(event, matchInfo, fixtureId, eventId) {
     console.log('Scoreboard + text sent in', Date.now()-t0, 'ms for', convIds.length, lang, 'subscribers');
 
     // STEP 2: Voice after text — use VOICE script not text script
-    var audioBuffer = await textToVoiceElevenLabs(voiceCommentary);
-    if (!audioBuffer) audioBuffer = await textToVoiceAzure(voiceCommentary);
+    var audioBuffer = await textToVoiceElevenLabs(commentary);
+    if (!audioBuffer) audioBuffer = await textToVoiceAzure(commentary);
     if (audioBuffer) {
       for (var i = 0; i < convIds.length; i++) {
         await sendVoiceChatwoot(convIds[i], audioBuffer);
