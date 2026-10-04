@@ -971,6 +971,62 @@ async function handleIncomingWhatsApp(payload) {
   } catch(e) { console.log('Handler error:', e.message); }
 }
 
+// ============= V1 MIGRATION =============
+async function runMigration() {
+  console.log('Starting WatchParty V1 migration...');
+  var statements = [
+    "ALTER TABLE wp_subscribers ADD COLUMN IF NOT EXISTS watchparty_iq INT DEFAULT 0",
+    "ALTER TABLE wp_subscribers ADD COLUMN IF NOT EXISTS iq_level VARCHAR(50) DEFAULT 'BEGINNER'",
+    "ALTER TABLE wp_subscribers ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP DEFAULT NOW()",
+    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS home_team_id VARCHAR(20)",
+    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS away_team_id VARCHAR(20)",
+    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS kickoff_utc TIMESTAMP",
+    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS is_derby BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS derby_name VARCHAR(100)",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS extra_minute INT DEFAULT 0",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS player_id VARCHAR(20)",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS team_id VARCHAR(20)",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS assist VARCHAR(100)",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS score_home_before INT DEFAULT 0",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS score_away_before INT DEFAULT 0",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS score_home_after INT DEFAULT 0",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS score_away_after INT DEFAULT 0",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS voice_version TEXT",
+    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS emotion_level NUMERIC(3,2) DEFAULT 0.4",
+    `CREATE TABLE IF NOT EXISTS wp_subscriber_teams (id SERIAL PRIMARY KEY, subscriber_id VARCHAR NOT NULL, team_name VARCHAR(100) NOT NULL, team_id VARCHAR(20), following_since TIMESTAMP DEFAULT NOW(), CONSTRAINT uq_subscriber_team UNIQUE (subscriber_id, team_name))`,
+    `CREATE TABLE IF NOT EXISTS wp_subscriber_preferences (subscriber_id VARCHAR PRIMARY KEY, goals BOOLEAN DEFAULT TRUE, red_cards BOOLEAN DEFAULT TRUE, predictions BOOLEAN DEFAULT TRUE, voice BOOLEAN DEFAULT TRUE, halftime BOOLEAN DEFAULT TRUE, fulltime BOOLEAN DEFAULT TRUE, important_only BOOLEAN DEFAULT FALSE, updated_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS wp_match_narrative (fixture_id VARCHAR PRIMARY KEY, opening_goal_team VARCHAR(100), lead_changes INT DEFAULT 0, equalizer_count INT DEFAULT 0, comeback BOOLEAN DEFAULT FALSE, late_goals INT DEFAULT 0, is_thriller BOOLEAN DEFAULT FALSE, biggest_lead INT DEFAULT 0, current_momentum VARCHAR(50), story_so_far TEXT, updated_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS wp_match_context (fixture_id VARCHAR PRIMARY KEY, situation VARCHAR(50) DEFAULT 'NORMAL', emotion_level NUMERIC(3,2) DEFAULT 0.4, is_derby BOOLEAN DEFAULT FALSE, derby_name VARCHAR(100), h2h_home_wins INT DEFAULT 0, h2h_away_wins INT DEFAULT 0, h2h_draws INT DEFAULT 0, last_event_type VARCHAR(50), last_event_minute INT, updated_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS wp_derby_database (id SERIAL PRIMARY KEY, team1 VARCHAR(100) NOT NULL, team2 VARCHAR(100) NOT NULL, derby_name VARCHAR(100) NOT NULL, rivalry_level INT DEFAULT 3, CONSTRAINT uq_derby_pair UNIQUE (team1, team2))`,
+    `CREATE TABLE IF NOT EXISTS wp_teams (team_id VARCHAR(20) PRIMARY KEY, name VARCHAR(100) NOT NULL, short_name VARCHAR(10), league VARCHAR(100), country VARCHAR(50), updated_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS wp_players (player_id VARCHAR(20) PRIMARY KEY, name VARCHAR(100) NOT NULL, nationality VARCHAR(50), current_team_id VARCHAR(20), current_team_name VARCHAR(100), position VARCHAR(20), updated_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS wp_player_seasons (id SERIAL PRIMARY KEY, player_id VARCHAR(20) NOT NULL, team_id VARCHAR(20), season VARCHAR(10) NOT NULL, appearances INT DEFAULT 0, goals INT DEFAULT 0, assists INT DEFAULT 0, yellow_cards INT DEFAULT 0, red_cards INT DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW(), CONSTRAINT uq_player_season UNIQUE (player_id, team_id, season))`,
+    `CREATE TABLE IF NOT EXISTS wp_player_transfers (id SERIAL PRIMARY KEY, player_id VARCHAR(20) NOT NULL, from_team VARCHAR(100), from_team_id VARCHAR(20), to_team VARCHAR(100), to_team_id VARCHAR(20), transfer_date DATE, transfer_type VARCHAR(20))`,
+    `CREATE TABLE IF NOT EXISTS wp_predictions (id SERIAL PRIMARY KEY, subscriber_id VARCHAR NOT NULL, fixture_id VARCHAR NOT NULL, prediction_type VARCHAR(30) NOT NULL, prediction_value VARCHAR(100) NOT NULL, correct BOOLEAN, iq_earned INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), CONSTRAINT uq_prediction UNIQUE (subscriber_id, fixture_id, prediction_type))`,
+    `CREATE TABLE IF NOT EXISTS wp_watchparty_iq (id SERIAL PRIMARY KEY, subscriber_id VARCHAR NOT NULL, fixture_id VARCHAR NOT NULL, predictions_correct INT DEFAULT 0, predictions_total INT DEFAULT 0, reactions_sent INT DEFAULT 0, iq_earned_this_match INT DEFAULT 0, total_iq INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), CONSTRAINT uq_iq_match UNIQUE (subscriber_id, fixture_id))`,
+    `CREATE TABLE IF NOT EXISTS wp_delivery_log (id SERIAL PRIMARY KEY, subscriber_id VARCHAR NOT NULL, fixture_id VARCHAR, event_key VARCHAR(200), text_sent BOOLEAN DEFAULT FALSE, text_delivered BOOLEAN DEFAULT FALSE, voice_sent BOOLEAN DEFAULT FALSE, voice_delivered BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`,
+    `INSERT INTO wp_derby_database (team1,team2,derby_name,rivalry_level) VALUES ('Arsenal','Tottenham','North London Derby',5),('Tottenham','Arsenal','North London Derby',5),('Liverpool','Everton','Merseyside Derby',5),('Everton','Liverpool','Merseyside Derby',5),('Manchester City','Manchester United','Manchester Derby',5),('Manchester United','Manchester City','Manchester Derby',5),('Chelsea','Arsenal','London Derby',4),('Arsenal','Chelsea','London Derby',4),('Chelsea','Tottenham','London Derby',4),('Tottenham','Chelsea','London Derby',4),('Manchester United','Liverpool','Northwest Derby',5),('Liverpool','Manchester United','Northwest Derby',5),('Real Madrid','Barcelona','El Clasico',5),('Barcelona','Real Madrid','El Clasico',5),('Celtic','Rangers','Old Firm Derby',5),('Rangers','Celtic','Old Firm Derby',5) ON CONFLICT DO NOTHING`,
+    "CREATE INDEX IF NOT EXISTS idx_processed_events_fixture ON wp_processed_events(fixture_id)",
+    "CREATE INDEX IF NOT EXISTS idx_processed_events_status ON wp_processed_events(status)",
+    "CREATE INDEX IF NOT EXISTS idx_matches_status ON wp_matches(status)",
+    "CREATE INDEX IF NOT EXISTS idx_subscriber_teams_sub ON wp_subscriber_teams(subscriber_id)",
+    "CREATE INDEX IF NOT EXISTS idx_predictions_subscriber ON wp_predictions(subscriber_id)",
+    "CREATE INDEX IF NOT EXISTS idx_iq_subscriber ON wp_watchparty_iq(subscriber_id)"
+  ];
+  var success = 0; var failed = 0;
+  for (var i = 0; i < statements.length; i++) {
+    try {
+      await queryDB(statements[i]);
+      success++;
+      console.log('OK (' + (i+1) + '/' + statements.length + ')');
+    } catch(e) {
+      failed++;
+      console.log('SKIP (' + (i+1) + '): ' + e.message.substring(0,80));
+    }
+  }
+  console.log('Migration done! Success:', success, 'Skipped:', failed);
+}
+
 // ============= HTTP SERVER =============
 var server = http.createServer(function(req, res) {
   if (req.method === 'GET' && req.url === '/health') {
@@ -980,6 +1036,12 @@ var server = http.createServer(function(req, res) {
   }
   if (req.method === 'GET' && req.url === '/poll-now') { res.writeHead(200); res.end('Polling!'); pollLiveMatches(); return; }
   if (req.method === 'GET' && req.url === '/reset-api-counter') { res.writeHead(200); res.end('Reset!'); resetAPICount(); return; }
+
+  if (req.method === 'GET' && req.url === '/run-migration') {
+    res.writeHead(200); res.end('Migration started! Check logs...');
+    runMigration();
+    return;
+  }
   if (req.method === 'POST' && req.url === '/webhook') {
     var body = '';
     req.on('data', function(c) { body += c; });
