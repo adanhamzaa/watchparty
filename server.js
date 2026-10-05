@@ -386,6 +386,89 @@ async function insertNewEvent(match, e) {
   return r.rows[0] ? { id: r.rows[0].id, key } : null;
 }
 
+// ========= V3A: MATCH BRAIN =========
+
+async function getRecentMatchEvents(fixtureId, limit) {
+  var r = await db("SELECT minute, extra_minute, event_type, player, team, home_score, away_score FROM wp_processed_events WHERE fixture_id=$1 AND status IN ('sent','pending') ORDER BY minute ASC, id ASC LIMIT $2", [fixtureId, limit || 8]);
+  return r.rows;
+}
+
+function getMatchPhase(minute) {
+  if (minute <= 15) return "OPENING";
+  if (minute <= 30) return "SETTLING";
+  if (minute <= 45) return "PRE_HALFTIME";
+  if (minute <= 60) return "SECOND_HALF_RESET";
+  if (minute <= 75) return "PRESSURE_PHASE";
+  return "CLOSING";
+}
+
+function getMatchTemperature(narrative, sit, minute) {
+  if (!narrative) return "CALM";
+  var total = (narrative.equalizerCount || 0) + (narrative.leadChanges || 0);
+  if (narrative.isThriller && minute >= 80) return "EXPLOSIVE";
+  if (narrative.comeback || total >= 3) return "CHAOTIC";
+  if ((narrative.lateGoals >= 1) || (total >= 2 && minute >= 70)) return "TENSE";
+  if (total >= 1 || minute >= 60 || sit === "OPENING_GOAL") return "BUILDING";
+  return "CALM";
+}
+
+function getCommentaryImportance(sit, minute, narrative) {
+  var isLate = minute >= 85;
+  var isThriller = narrative && narrative.isThriller;
+  if (sit === "EQUALIZER" && isLate) return "ICONIC";
+  if (sit === "LATE_GOAL" && isLate && isThriller) return "ICONIC";
+  if (sit === "EQUALIZER" || (sit === "LATE_GOAL" && minute >= 80)) return "MAJOR";
+  if (sit === "GO_AHEAD_GOAL" || sit === "TWO_GOAL_LEAD") return "IMPORTANT";
+  return "INTERESTING";
+}
+
+async function updateMatchNarrative(fixtureId, match, scoreBefore, scoreAfter) {
+  try {
+    var evR = await db("SELECT minute, extra_minute, event_type, player, team, home_score, away_score FROM wp_processed_events WHERE fixture_id=$1 AND event_type='Goal' ORDER BY minute ASC, id ASC", [fixtureId]);
+    var events = evR.rows;
+    if (!events.length) return null;
+    var openingGoalTeam = null, equalizerCount = 0, comeback = false, lateGoals = 0, biggestLead = 0, currentMomentum = null, leadChanges = 0;
+    var prevHome = 0, prevAway = 0, homeWasTwoDown = false, awayWasTwoDown = false;
+    for (var i = 0; i < events.length; i++) {
+      var e = events[i];
+      var homeScore = Number(e.home_score !== null && e.home_score !== undefined ? e.home_score : prevHome);
+      var awayScore = Number(e.away_score !== null && e.away_score !== undefined ? e.away_score : prevAway);
+      var matchMin = Number(e.minute || 0) + Number(e.extra_minute || 0);
+      var beforeDiff = prevHome - prevAway, afterDiff = homeScore - awayScore;
+      var team = e.team || (homeScore > prevHome ? match.home : match.away);
+      if (!openingGoalTeam) openingGoalTeam = team;
+      if (matchMin >= 75) lateGoals++;
+      if (Math.abs(afterDiff) > biggestLead) biggestLead = Math.abs(afterDiff);
+      if (afterDiff === 0 && beforeDiff !== 0) equalizerCount++;
+      if (beforeDiff !== 0 && afterDiff !== 0 && Math.sign(beforeDiff) !== Math.sign(afterDiff)) leadChanges++;
+      if (afterDiff <= -2) homeWasTwoDown = true;
+      if (afterDiff >= 2) awayWasTwoDown = true;
+      if (homeWasTwoDown && afterDiff >= 0) comeback = true;
+      if (awayWasTwoDown && afterDiff <= 0) comeback = true;
+      prevHome = homeScore; prevAway = awayScore; currentMomentum = team;
+    }
+    var isThriller = comeback || leadChanges >= 2 || lateGoals >= 2 || equalizerCount >= 2;
+    var parts = [];
+    if (openingGoalTeam) parts.push(openingGoalTeam + ' scored first');
+    if (equalizerCount > 0) parts.push(equalizerCount + ' equalizer' + (equalizerCount > 1 ? 's' : ''));
+    if (leadChanges > 0) parts.push(leadChanges + ' lead change' + (leadChanges > 1 ? 's' : ''));
+    if (comeback) parts.push('comeback underway');
+    if (lateGoals > 0) parts.push(lateGoals + ' late goal' + (lateGoals > 1 ? 's' : ''));
+    var storySoFar = parts.length ? parts.join(', ') : 'Quiet match so far';
+    var bd = scoreBefore.home - scoreBefore.away, ad = scoreAfter.home - scoreAfter.away;
+    var whatChanged = '';
+    if (bd > 0 && ad === 0) whatChanged = match.away + ' pull level!';
+    else if (bd < 0 && ad === 0) whatChanged = match.home + ' pull level!';
+    else if (bd === 0 && ad > 0) whatChanged = match.home + ' take the lead!';
+    else if (bd === 0 && ad < 0) whatChanged = match.away + ' take the lead!';
+    else if (Math.sign(bd) !== Math.sign(ad)) whatChanged = 'Lead has changed hands!';
+    else if (Math.abs(ad) >= 2) whatChanged = (ad > 0 ? match.home : match.away) + ' now two goals clear!';
+    await db("INSERT INTO wp_match_narrative (fixture_id,opening_goal_team,lead_changes,equalizer_count,comeback,late_goals,is_thriller,biggest_lead,current_momentum,story_so_far,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) ON CONFLICT (fixture_id) DO UPDATE SET opening_goal_team=EXCLUDED.opening_goal_team,lead_changes=EXCLUDED.lead_changes,equalizer_count=EXCLUDED.equalizer_count,comeback=EXCLUDED.comeback,late_goals=EXCLUDED.late_goals,is_thriller=EXCLUDED.is_thriller,biggest_lead=EXCLUDED.biggest_lead,current_momentum=EXCLUDED.current_momentum,story_so_far=EXCLUDED.story_so_far,updated_at=NOW()",
+      [fixtureId, openingGoalTeam, leadChanges, equalizerCount, comeback, lateGoals, isThriller, biggestLead, currentMomentum, storySoFar]);
+    return { openingGoalTeam, leadChanges, equalizerCount, comeback, lateGoals, isThriller, biggestLead, currentMomentum, storySoFar, whatChanged };
+  } catch(err) { console.log("Narrative error:", err.message); return null; }
+}
+
 // ========= VOLUME 2 HELPERS =========
 async function getRecentCommentary(fixtureId) {
   const r = await db(`
@@ -409,39 +492,51 @@ function parseClaudeJSON(text) {
 async function generateCommentary(context) {
   if (!process.env.ANTHROPIC_KEY) { console.log("ANTHROPIC_KEY missing"); return null; }
   const history = context.history.length ? context.history.map((x,i) => `${i+1}. ${x}`).join("\n") : "No previous reactions.";
-  const prompt = `You are WatchParty AI — a passionate Nairobi football fan reacting to a LIVE football event.
-You are NOT a TV commentator. You are reacting immediately as the event happens.
-STYLE: Natural Kenyan football-fan energy. Short. Spontaneous. Emotional. Never robotic. Never invent facts.
-TEXT SCRIPT: 1-2 short sentences. Useful football information plus personality.
-VOICE SCRIPT: Completely separate spoken reaction. Sound like a Kenyan football fan sending a WhatsApp voice note. Normal: 7-9 seconds. Late goals/derby: 12-15 seconds.
-SITUATION: ${context.situation}
-MATCH: ${context.home} ${context.homeScore}-${context.awayScore} ${context.away}
-COMPETITION: ${context.competition}
-MINUTE: ${context.minute}
-SCORER: ${context.scorer}
-DERBY: ${context.derby || "None"}
-PREVIOUS REACTIONS:\n${history}
-IMPORTANT: Do not repeat the wording, opening phrase or emotional pattern of previous reactions.
-Return ONLY valid JSON: {"text_script": "...", "voice_script": "..."}`;
+    var narrativeText = '';
+  if (context.narrative) {
+    var n = context.narrative;
+    narrativeText = 'MATCH STORY: ' + (n.storySoFar || 'Match just started') + '\n' +
+      (n.whatChanged ? 'WHAT CHANGED: ' + n.whatChanged + '\n' : '') +
+      'Momentum: ' + (n.currentMomentum || 'Even') + ' | Thriller: ' + (n.isThriller ? 'YES' : 'NO');
+  }
+  var recentEventsText = '';
+  if (context.recentEvents && context.recentEvents.length) {
+    recentEventsText = 'RECENT: ' + context.recentEvents.slice(-3).map(function(ev) {
+      return ev.minute + "' " + ev.event_type + (ev.player ? ' ' + ev.player : '');
+    }).join(', ');
+  }
+  var promptText = 'You are WatchParty football commentator for East African fans.\n\n' +
+    'RULES: ENGLISH ONLY. No Swahili. No Sheng. Kenyan personality through emotion not language. Never invent facts. React to significance not just the event.\n\n' +
+    'MATCH: ' + context.home + ' ' + context.homeScore + '-' + context.awayScore + ' ' + context.away + '\n' +
+    'COMPETITION: ' + context.competition + '\n' +
+    'MINUTE: ' + context.minute + ' | SCORER: ' + context.scorer + '\n' +
+    'SITUATION: ' + (context.situation || 'GOAL') + ' | DERBY: ' + (context.derby || 'None') + '\n' +
+    'PHASE: ' + (context.phase || 'UNKNOWN') + ' | TEMPERATURE: ' + (context.temperature || 'CALM') + ' | IMPORTANCE: ' + (context.importance || 'INTERESTING') + '\n\n' +
+    (narrativeText ? narrativeText + '\n\n' : '') +
+    (recentEventsText ? recentEventsText + '\n\n' : '') +
+    'PREVIOUS REACTIONS:\n' + history + '\n\n' +
+    'TEXT: 1-2 sentences. English. Strong personality.\n' +
+    'VOICE: English only. Natural spoken. 8-12 seconds normally, 12-15 for MAJOR/ICONIC moments.\n\n' +
+    'Return ONLY: {"text_script": "...", "voice_script": "..."}';
+  const prompt = promptText;
 
-  return new Promise(resolve => {
-    const body = JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 300, messages: [{ role: "user", content: prompt }] });
-    const req = https.request({
-      hostname: "api.anthropic.com", path: "/v1/messages", method: "POST",
+  return new Promise(function(resolve) {
+    const body = JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 300, temperature: 0.8, messages: [{ role: "user", content: prompt }] });
+    const req = https.request({ hostname: "api.anthropic.com", path: "/v1/messages", method: "POST",
       headers: { "x-api-key": process.env.ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json", "content-length": Buffer.byteLength(body) }
-    }, res => {
+    }, function(res) {
       let data = "";
-      res.on("data", c => data += c);
-      res.on("end", () => {
+      res.on("data", function(c) { data += c; });
+      res.on("end", function() {
         try {
           if (res.statusCode < 200 || res.statusCode >= 300) { console.log("Claude HTTP", res.statusCode); return resolve(null); }
           const json = JSON.parse(data);
-          resolve(parseClaudeJSON(json.content?.[0]?.text || ""));
-        } catch (e) { console.log("Claude error:", e.message); resolve(null); }
+          resolve(parseClaudeJSON(json.content && json.content[0] ? json.content[0].text : ""));
+        } catch(e) { console.log("Claude error:", e.message); resolve(null); }
       });
     });
-    req.on("error", e => { console.log("Claude request error:", e.message); resolve(null); });
-    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    req.on("error", function(e) { console.log("Claude request error:", e.message); resolve(null); });
+    req.setTimeout(15000, function() { req.destroy(); resolve(null); });
     req.write(body); req.end();
   });
 }
@@ -563,17 +658,27 @@ async function processEvent(match, e, row) {
     return;
   }
 
+  // V3A: Match Brain
+  var narrative = await updateMatchNarrative(match.fixtureId, match, before, after);
+  var recentEvents = await getRecentMatchEvents(match.fixtureId, 8);
+  var phase = getMatchPhase(e.minute);
+  var temperature = getMatchTemperature(narrative, sit, e.minute);
+  var importance = getCommentaryImportance(sit, e.minute, narrative);
+  console.log("V3A:", sit, phase, temperature, importance);
+
   // Commentary history
   const history = await getRecentCommentary(match.fixtureId);
 
-  // Claude AI commentary
+  // Claude AI commentary with V3A context
   const ai = await generateCommentary({
     competition: match.league || "Football",
     home: match.home, away: match.away,
     homeScore: after.home, awayScore: after.away,
     scorer: e.player || "Unknown",
-    minute: `${e.minute}${e.extra ? "+" + e.extra : ""}`,
-    situation: sit, derby: derbyName, history
+    minute: String(e.minute) + (e.extra ? "+" + e.extra : ""),
+    situation: sit, derby: derbyName, history,
+    narrative: narrative, recentEvents: recentEvents,
+    phase: phase, temperature: temperature, importance: importance
   });
 
   // Fallback if Claude fails
