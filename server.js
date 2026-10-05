@@ -6,6 +6,9 @@ const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const GOAL_API_KEY = process.env.GOAL_API_KEY;
 const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "p0TiOqMl1M1IbvZ0ke9s";
 const CHATWOOT_URL = process.env.CHATWOOT_URL || "chatwoot-production-5bb4.up.railway.app";
 const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || "1";
@@ -186,6 +189,20 @@ async function saveMatch(m) {
   `, [m.fixtureId, m.league, m.country, m.home, m.away, m.status,
       m.homeScore, m.awayScore, m.kickoffUtc ? new Date(m.kickoffUtc) : null,
       m.homeId || null, m.awayId || null]);
+}
+
+async function addVolume2Columns() {
+  await db("ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS voice_script TEXT").catch(() => {});
+  await db("ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS situation VARCHAR(40)").catch(() => {});
+  console.log("Volume 2 columns ready!");
+}
+
+async function addVolume2Columns() {
+  try {
+    await db("ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS voice_script TEXT");
+    await db("ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS situation VARCHAR(40)");
+    console.log("Volume 2 columns ready!");
+  } catch(e) { console.log("Volume 2 columns:", e.message); }
 }
 
 async function schemaCheck() {
@@ -369,6 +386,116 @@ async function insertNewEvent(match, e) {
   return r.rows[0] ? { id: r.rows[0].id, key } : null;
 }
 
+// ========= VOLUME 2 HELPERS =========
+async function getRecentCommentary(fixtureId) {
+  const r = await db(`
+    SELECT commentary_text FROM wp_processed_events
+    WHERE fixture_id=$1 AND status='sent'
+    AND commentary_text IS NOT NULL AND commentary_text <> ''
+    ORDER BY id DESC LIMIT 5
+  `, [fixtureId]);
+  return r.rows.map(r => r.commentary_text);
+}
+
+function parseClaudeJSON(text) {
+  try {
+    const cleaned = String(text || "")
+      .replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+    const parsed = JSON.parse(cleaned);
+    return { text_script: String(parsed.text_script || "").trim(), voice_script: String(parsed.voice_script || "").trim() };
+  } catch (e) { console.log("Claude JSON parse error:", e.message); return null; }
+}
+
+async function generateCommentary(context) {
+  if (!process.env.ANTHROPIC_KEY) { console.log("ANTHROPIC_KEY missing"); return null; }
+  const history = context.history.length ? context.history.map((x,i) => `${i+1}. ${x}`).join("\n") : "No previous reactions.";
+  const prompt = `You are WatchParty AI — a passionate Nairobi football fan reacting to a LIVE football event.
+You are NOT a TV commentator. You are reacting immediately as the event happens.
+STYLE: Natural Kenyan football-fan energy. Short. Spontaneous. Emotional. Never robotic. Never invent facts.
+TEXT SCRIPT: 1-2 short sentences. Useful football information plus personality.
+VOICE SCRIPT: Completely separate spoken reaction. Sound like a Kenyan football fan sending a WhatsApp voice note. Normal: 7-9 seconds. Late goals/derby: 12-15 seconds.
+SITUATION: ${context.situation}
+MATCH: ${context.home} ${context.homeScore}-${context.awayScore} ${context.away}
+COMPETITION: ${context.competition}
+MINUTE: ${context.minute}
+SCORER: ${context.scorer}
+DERBY: ${context.derby || "None"}
+PREVIOUS REACTIONS:\n${history}
+IMPORTANT: Do not repeat the wording, opening phrase or emotional pattern of previous reactions.
+Return ONLY valid JSON: {"text_script": "...", "voice_script": "..."}`;
+
+  return new Promise(resolve => {
+    const body = JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 300, messages: [{ role: "user", content: prompt }] });
+    const req = https.request({
+      hostname: "api.anthropic.com", path: "/v1/messages", method: "POST",
+      headers: { "x-api-key": process.env.ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json", "content-length": Buffer.byteLength(body) }
+    }, res => {
+      let data = "";
+      res.on("data", c => data += c);
+      res.on("end", () => {
+        try {
+          if (res.statusCode < 200 || res.statusCode >= 300) { console.log("Claude HTTP", res.statusCode); return resolve(null); }
+          const json = JSON.parse(data);
+          resolve(parseClaudeJSON(json.content?.[0]?.text || ""));
+        } catch (e) { console.log("Claude error:", e.message); resolve(null); }
+      });
+    });
+    req.on("error", e => { console.log("Claude request error:", e.message); resolve(null); });
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    req.write(body); req.end();
+  });
+}
+
+function textToVoiceElevenLabs(text, sit) {
+  return new Promise(resolve => {
+    if (!ELEVENLABS_API_KEY) return resolve(null);
+    let clean = String(text || "").replace(/[^\x00-\x7F]/g, "").replace(/\*\*/g, "").replace(/#/g, "").trim();
+    if (!clean) return resolve(null);
+    const maxChars = (sit === "LATE_GOAL" || sit === "EQUALIZER" || sit === "OPENING_GOAL") ? 260 : 190;
+    if (clean.length > maxChars) clean = clean.substring(0, maxChars);
+    const body = JSON.stringify({
+      text: clean, model_id: "eleven_multilingual_v2",
+      voice_settings: { stability: 0.45, similarity_boost: 0.80, style: 0.00, speed: 0.88, use_speaker_boost: true }
+    });
+    const req = https.request({
+      hostname: "api.elevenlabs.io",
+      path: `/v1/text-to-speech/${encodeURIComponent(ELEVENLABS_VOICE_ID)}?output_format=mp3_44100_128`,
+      method: "POST",
+      headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json", "Accept": "audio/mpeg", "Content-Length": Buffer.byteLength(body) }
+    }, res => {
+      const chunks = [];
+      res.on("data", chunk => chunks.push(chunk));
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) { console.log("ElevenLabs voice OK"); return resolve(Buffer.concat(chunks)); }
+        console.log("ElevenLabs HTTP", res.statusCode); resolve(null);
+      });
+    });
+    req.on("error", err => { console.log("ElevenLabs error:", err.message); resolve(null); });
+    req.setTimeout(20000, () => { req.destroy(); resolve(null); });
+    req.write(body); req.end();
+  });
+}
+
+function sendVoiceChatwoot(conversationId, audioBuffer) {
+  return new Promise(resolve => {
+    const boundary = "----WatchParty" + Date.now();
+    const header = `--${boundary}\r\nContent-Disposition: form-data; name="attachments[]"; filename="reaction.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`;
+    const footer = `\r\n--${boundary}--\r\n`;
+    const body = Buffer.concat([Buffer.from(header), audioBuffer, Buffer.from(footer)]);
+    const req = https.request({
+      hostname: CHATWOOT_URL,
+      path: `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${encodeURIComponent(conversationId)}/messages`,
+      method: "POST",
+      headers: { "api_access_token": CHATWOOT_TOKEN, "Content-Type": `multipart/form-data; boundary=${boundary}`, "Content-Length": body.length }
+    }, res => {
+      res.on("data", () => {});
+      res.on("end", () => { const ok = res.statusCode >= 200 && res.statusCode < 300; if (!ok) console.log("Chatwoot voice failed:", res.statusCode); resolve(ok); });
+    });
+    req.on("error", err => { console.log("Chatwoot voice error:", err.message); resolve(false); });
+    req.write(body); req.end();
+  });
+}
+
 // ========= SCORE RECONSTRUCTION =========
 async function matchScoreFromEvents(match) {
   const r = await db(`
@@ -404,8 +531,11 @@ async function derby(match) {
   return r.rows[0]?.derby_name || null;
 }
 
-// ========= PROCESS EVENT =========
+// ========= PROCESS EVENT — VOLUME 2 =========
 async function processEvent(match, e, row) {
+  const t0 = Date.now();
+
+  // Score
   const before = await matchScoreFromEvents(match);
   let after = { ...before };
   if (e.type === "Goal") {
@@ -413,14 +543,12 @@ async function processEvent(match, e, row) {
     else after.away++;
     if (e.homeAfter !== null && e.awayAfter !== null) { after.home = e.homeAfter; after.away = e.awayAfter; }
   }
+
+  // Situation + Derby
   const sit = situation(before, after, e);
   const derbyName = await derby(match);
-  const message = `${e.type === "Goal" ? "⚽" : "🟥"} ${match.league}\n` +
-    `${match.home} ${after.home}–${after.away} ${match.away}\n` +
-    `${e.minute}${e.extra ? "+" + e.extra : ""}\'` +
-    `${e.player ? " — " + e.player : ""}` +
-    `${derbyName ? "\n🔥 " + derbyName : ""}`;
 
+  // Subscribers
   const r = await db(`
     SELECT s.conversation_id FROM wp_subscribers s
     JOIN wp_subscriber_teams st ON st.subscriber_id = s.conversation_id
@@ -430,22 +558,72 @@ async function processEvent(match, e, row) {
     )
   `, [match.homeId||"", match.awayId||"", match.home, match.away]);
 
+  if (!r.rows.length) {
+    await db("UPDATE wp_processed_events SET status='failed' WHERE id=$1", [row.id]);
+    return;
+  }
+
+  // Commentary history
+  const history = await getRecentCommentary(match.fixtureId);
+
+  // Claude AI commentary
+  const ai = await generateCommentary({
+    competition: match.league || "Football",
+    home: match.home, away: match.away,
+    homeScore: after.home, awayScore: after.away,
+    scorer: e.player || "Unknown",
+    minute: `${e.minute}${e.extra ? "+" + e.extra : ""}`,
+    situation: sit, derby: derbyName, history
+  });
+
+  // Fallback if Claude fails
+  const textScript = ai?.text_script ||
+    `${e.type === "Goal" ? "⚽ GOAL!" : "🟥 RED CARD!"} ${e.player ? e.player + " — " : ""}${match.home} ${after.home}-${after.away} ${match.away}`;
+  const voiceScript = ai?.voice_script || textScript;
+
+  // Build full text message
+  const textMessage =
+    `${e.type === "Goal" ? "⚽" : "🟥"} ${match.league}\n` +
+    `${match.home} ${after.home}-${after.away} ${match.away}\n` +
+    `${e.minute}${e.extra ? "+" + e.extra : ""}\'` +
+    `${e.player ? " — " + e.player : ""}` +
+    `${derbyName ? "\n🔥 " + derbyName : ""}` +
+    `\n\n${textScript}`;
+
+  // Send text first — always immediate
   let sent = 0;
   for (const sub of r.rows) {
-    const ok = await sendChatwoot(sub.conversation_id, message);
-    await db(`INSERT INTO wp_delivery_log (subscriber_id,fixture_id,event_key,text_sent,text_delivered) VALUES ($1,$2,$3,true,$4)`,
+    const ok = await sendChatwoot(sub.conversation_id, textMessage);
+    await db("INSERT INTO wp_delivery_log (subscriber_id,fixture_id,event_key,text_sent,text_delivered) VALUES ($1,$2,$3,true,$4)",
       [sub.conversation_id, match.fixtureId, row.key, ok]).catch(() => {});
     if (ok) sent++;
     await sleep(200);
   }
 
-  if (sent) {
-    await db(`UPDATE wp_processed_events SET status='sent', commentary_text=$1, home_score=$2, away_score=$3, score_home_before=$4, score_away_before=$5, score_home_after=$6, score_away_after=$7, emotion_level=$8, processed_at=NOW() WHERE id=$9`,
-      [message, after.home, after.away, before.home, before.away, after.home, after.away,
+  if (sent > 0) {
+    await db(`UPDATE wp_processed_events SET status='sent', commentary_text=$1, voice_script=$2, situation=$3, home_score=$4, away_score=$5, score_home_before=$6, score_away_before=$7, score_home_after=$8, score_away_after=$9, emotion_level=$10, processed_at=NOW() WHERE id=$11`,
+      [textScript, voiceScript, sit, after.home, after.away, before.home, before.away, after.home, after.away,
        e.minute >= 75 ? 0.95 : sit === "EQUALIZER" ? 0.85 : 0.65, row.id]);
   } else {
-    await db(`UPDATE wp_processed_events SET status='failed' WHERE id=$1`, [row.id]);
+    await db("UPDATE wp_processed_events SET status='failed' WHERE id=$1", [row.id]);
+    return;
   }
+
+  // Voice — non-blocking, does not delay next event
+  if (ELEVENLABS_API_KEY && voiceScript) {
+    Promise.resolve().then(async () => {
+      console.log("Generating voice:", sit, "for", match.home, "vs", match.away);
+      const audio = await textToVoiceElevenLabs(voiceScript, sit);
+      if (!audio) { console.log("Voice generation failed"); return; }
+      for (const sub of r.rows) {
+        await sendVoiceChatwoot(sub.conversation_id, audio);
+        await sleep(200);
+      }
+      console.log("Voice delivery complete:", Date.now() - t0, "ms");
+    }).catch(err => console.log("Non-blocking voice error:", err.message));
+  }
+
+  console.log("Event complete:", match.home, "vs", match.away, sit, Date.now() - t0, "ms");
 }
 
 // ========= EVENT QUEUE =========
@@ -586,6 +764,7 @@ server.listen(PORT, async () => {
   console.log("WatchParty V1 starting on port", PORT);
   try {
     await schemaCheck();
+    await addVolume2Columns();
     await closeOldPending();
     console.log("GOAL API:", GOAL_API_KEY ? "Ready" : "Missing");
     console.log("API-Football fallback:", FOOTBALL_API_KEY ? "Ready" : "Missing");
