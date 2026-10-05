@@ -256,10 +256,24 @@ async function resolveTeam(text) {
     const candidates = r.data.map(t => ({
       id: String(t.id || t.teamId || ""),
       name: String(t.name || t.teamName || ""),
-      country: String(t.country?.name || t.country || "")
-    })).filter(t => t.id && t.name);
-    const exact = candidates.find(t => norm(t.name) === norm(wanted));
-    if (exact) return exact;
+      country: String(t.country?.name || t.country || ""),
+      fixtures: (t._count?.homeFixtures || 0) + (t._count?.awayFixtures || 0),
+      hasBadge: !!t.badge
+    })).filter(t => t.id && t.name)
+      // Exclude women's teams
+      .filter(t => !WOMEN.some(w => norm(t.name).includes(w)));
+
+    // Prefer: exact name + has country + most fixtures
+    candidates.sort((a, b) => {
+      const aExact = norm(a.name) === norm(wanted) ? 1 : 0;
+      const bExact = norm(b.name) === norm(wanted) ? 1 : 0;
+      if (aExact !== bExact) return bExact - aExact;
+      const aHasCountry = a.country ? 1 : 0;
+      const bHasCountry = b.country ? 1 : 0;
+      if (aHasCountry !== bHasCountry) return bHasCountry - aHasCountry;
+      return b.fixtures - a.fixtures;
+    });
+
     if (candidates[0]) return candidates[0];
   }
   if (COMMON[norm(text)]) return { id: null, name: COMMON[norm(text)], country: "England" };
