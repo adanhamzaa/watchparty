@@ -1,1091 +1,586 @@
-const https = require('https');
-const http = require('http');
-const { Client } = require('pg');
+const https = require("https");
+const http = require("http");
+const { Client } = require("pg");
 
-const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
-const HIGHLIGHTLY_KEY = process.env.HIGHLIGHTLY_API_KEY;
-const CHATWOOT_URL = process.env.CHATWOOT_URL || 'chatwoot-production-5bb4.up.railway.app';
-const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
 const PORT = process.env.PORT || 3000;
-const AZURE_KEY = process.env.AZURE_SPEECH_KEY;
-const AZURE_REGION = process.env.AZURE_SPEECH_REGION || 'eastus';
-const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
-const GOAL_API_KEY = process.env.GOAL_API_KEY;
-const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'p0TiOqMl1M1IbvZ0ke9s';
 const DATABASE_URL = process.env.DATABASE_URL;
+const GOAL_API_KEY = process.env.GOAL_API_KEY;
+const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
+const CHATWOOT_URL = process.env.CHATWOOT_URL || "chatwoot-production-5bb4.up.railway.app";
+const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
+const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || "1";
+const POLL_MS = 3 * 60 * 1000;
 
-// Per-fixture sequential queues
-var matchQueues = {};
-var isPolling = false; // Single polling controller
+const ALLOWED = [
+  "premier league","fa cup","carabao cup","efl cup","league cup",
+  "champions league","europa league","conference league","uefa conference league"
+];
+const WOMEN = [
+  "women","woman","womens","women's","wsl","nwsl","feminine",
+  "femenina","feminin","frauen","female"
+];
 
-// ============= DATABASE =============
-async function queryDB(sql, params) {
-  var client = new Client({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 5000 });
-  try { await client.connect(); var r = await client.query(sql, params); await client.end(); return r; }
-  catch(e) { try { await client.end(); } catch(x) {} throw e; }
+let polling = false;
+const liveMatches = new Map();
+const queues = new Map();
+const nextEventPoll = new Map();
+let goalBackoffUntil = 0;
+let footballBackoffUntil = 0;
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function norm(s) {
+  return String(s || "").toLowerCase().replace(/[.''`-]/g," ").replace(/\s+/g," ").trim();
 }
 
-async function setupDB() {
-  try {
-    await queryDB(`CREATE TABLE IF NOT EXISTS wp_subscribers (
-      id SERIAL PRIMARY KEY,
-      conversation_id VARCHAR(50) UNIQUE NOT NULL,
-      language VARCHAR(20) DEFAULT 'sheng',
-      teams TEXT DEFAULT 'all',
-      active BOOLEAN DEFAULT true,
-      created_at TIMESTAMP DEFAULT NOW(),
-      last_message_at TIMESTAMP DEFAULT NOW()
-    )`);
-
-    // FIX #6: store actual commentary text not just event_type
-    await queryDB(`CREATE TABLE IF NOT EXISTS wp_processed_events (
-      id SERIAL PRIMARY KEY,
-      event_key VARCHAR(200) UNIQUE NOT NULL,
-      fixture_id BIGINT,
-      minute INT,
-      event_type VARCHAR(50),
-      player VARCHAR(100),
-      team VARCHAR(100),
-      home_score INT DEFAULT 0,
-      away_score INT DEFAULT 0,
-      commentary_text TEXT,
-      status VARCHAR(20) DEFAULT 'pending',
-      processed_at TIMESTAMP DEFAULT NOW()
-    )`);
-
-    await queryDB(`CREATE TABLE IF NOT EXISTS wp_matches (
-      fixture_id BIGINT PRIMARY KEY,
-      league_name VARCHAR(100),
-      country VARCHAR(100),
-      home_team VARCHAR(100),
-      away_team VARCHAR(100),
-      status VARCHAR(20),
-      home_score INT DEFAULT 0,
-      away_score INT DEFAULT 0,
-      kickoff TIMESTAMP,
-      last_checked TIMESTAMP DEFAULT NOW()
-    )`);
-
-    // FIX #3: persist API request count across restarts
-    await queryDB(`CREATE TABLE IF NOT EXISTS wp_api_usage (
-      provider VARCHAR(50) PRIMARY KEY,
-      request_count INT NOT NULL DEFAULT 0,
-      reset_at TIMESTAMP NOT NULL,
-      remaining INT DEFAULT 100,
-      updated_at TIMESTAMP DEFAULT NOW()
-    )`);
-    await queryDB('ALTER TABLE wp_api_usage ADD COLUMN IF NOT EXISTS remaining INT DEFAULT 100').catch(function(){});
-    // Ensure today's row exists
-    await initAPICounter();
-
-    // FIX #4: track video jobs per event
-    await queryDB(`CREATE TABLE IF NOT EXISTS wp_video_jobs (
-      id SERIAL PRIMARY KEY,
-      event_key VARCHAR(200) UNIQUE NOT NULL,
-      fixture_id BIGINT,
-      home_team VARCHAR(100),
-      away_team VARCHAR(100),
-      goal_minute INT DEFAULT 0,
-      status VARCHAR(20) DEFAULT 'pending',
-      video_url TEXT,
-      attempt INT DEFAULT 0,
-      next_retry TIMESTAMP,
-      created_at TIMESTAMP DEFAULT NOW()
-    )`);
-    await queryDB('ALTER TABLE wp_video_jobs ADD COLUMN IF NOT EXISTS goal_minute INT DEFAULT 0').catch(function(){});
-
-    console.log('WatchParty DB ready!');
-  } catch(e) { console.log('DB setup error:', e.message); }
+function allowedCompetition(name) {
+  const n = norm(name);
+  return !!n && !WOMEN.some(x => n.includes(x)) && ALLOWED.some(x => n === x || n.includes(x));
 }
 
-// ============= GOAL API (1000 requests/day free) =============
-function goalAPI(path) {
-  return new Promise(function(resolve) {
-    if (!GOAL_API_KEY) { resolve(null); return; }
-    var options = {
-      hostname: 'api.goal-api.com',
-      path: '/v1' + path,
-      method: 'GET',
-      headers: { 'Authorization': 'Bearer ' + GOAL_API_KEY, 'Content-Type': 'application/json' }
-    };
-    var req = https.request(options, function(res) {
-      var d = '';
-      res.on('data', function(c) { d += c; });
-      res.on('end', function() {
-        try {
-          var result = JSON.parse(d);
-          console.log('GOAL API:', path, '| Status:', res.statusCode);
-          resolve(result);
-        } catch(e) { resolve(null); }
+function requestJson(hostname, path, headers, method = "GET") {
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname, path, method, headers, timeout: 10000 }, res => {
+      let body = "";
+      res.on("data", c => body += c);
+      res.on("end", () => {
+        let json = null;
+        try { json = body ? JSON.parse(body) : null; } catch {}
+        resolve({ status: res.statusCode, headers: res.headers, body: json });
       });
     });
-    req.on('error', function(e) { console.log('GOAL API error:', e.message); resolve(null); });
-    setTimeout(function() { req.destroy(); resolve(null); }, 10000);
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.on("error", reject);
     req.end();
   });
 }
 
-// ============= FIX #3: Persistent API counter =============
-// Get next midnight UTC
-function nextMidnightUTC() {
-  var d = new Date();
-  d.setUTCHours(24, 0, 0, 0);
-  return d;
-}
-
-// Init or reset counter if past reset_at
-async function initAPICounter() {
+async function db(sql, params = []) {
+  const c = new Client({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 8000 });
   try {
-    var resetAt = nextMidnightUTC();
-    await queryDB(
-      `INSERT INTO wp_api_usage (provider, request_count, remaining, reset_at)
-       VALUES ('api-football', 0, 100, $1)
-       ON CONFLICT (provider) DO UPDATE SET
-         request_count = CASE WHEN wp_api_usage.reset_at <= NOW() THEN 0 ELSE wp_api_usage.request_count END,
-         remaining = CASE WHEN wp_api_usage.reset_at <= NOW() THEN 100 ELSE wp_api_usage.remaining END,
-         reset_at = CASE WHEN wp_api_usage.reset_at <= NOW() THEN $1 ELSE wp_api_usage.reset_at END,
-         updated_at = NOW()`,
-      [resetAt]
-    );
-    var row = await queryDB("SELECT request_count, remaining, reset_at FROM wp_api_usage WHERE provider='api-football'");
-    if (row.rows.length > 0) {
-      console.log('API counter: ' + row.rows[0].request_count + ' used, ' + row.rows[0].remaining + ' remaining, resets at ' + row.rows[0].reset_at);
-    }
-  } catch(e) { console.log('initAPICounter error:', e.message); }
-}
-
-async function getAPICount() {
-  try {
-    await initAPICounter(); // Auto-reset if new day
-    var result = await queryDB("SELECT request_count, remaining FROM wp_api_usage WHERE provider='api-football'");
-    if (result.rows.length > 0) return parseInt(result.rows[0].request_count) || 0;
-    return 0;
-  } catch(e) { console.log('getAPICount error:', e.message); return 0; }
-}
-
-async function incrementAPICount(remainingFromHeader) {
-  try {
-    var updateRemaining = remainingFromHeader !== undefined ? ', remaining = $1' : '';
-    if (remainingFromHeader !== undefined) {
-      await queryDB(
-        "UPDATE wp_api_usage SET request_count = request_count + 1, remaining = $1, updated_at = NOW() WHERE provider='api-football'",
-        [remainingFromHeader]
-      );
-    } else {
-      await queryDB(
-        "UPDATE wp_api_usage SET request_count = request_count + 1, remaining = GREATEST(remaining - 1, 0), updated_at = NOW() WHERE provider='api-football'"
-      );
-    }
-  } catch(e) { console.log('incrementAPICount error:', e.message); }
-}
-
-async function resetAPICount() {
-  try {
-    var resetAt = nextMidnightUTC();
-    await queryDB(
-      "UPDATE wp_api_usage SET request_count=0, remaining=100, reset_at=$1, updated_at=NOW() WHERE provider='api-football'",
-      [resetAt]
-    );
-    console.log('API counter manually reset!');
-  } catch(e) { console.log('resetAPICount error:', e.message); }
-}
-
-// ============= API-FOOTBALL =============
-async function footballAPI(path) {
-  if (!FOOTBALL_API_KEY) return null;
-  var count = await getAPICount();
-  // Use actual remaining from API-Football headers (stored in DB)
-  var usageRow = null;
-  try { usageRow = await queryDB("SELECT remaining, request_count FROM wp_api_usage WHERE provider='api-football'"); } catch(e) {}
-  var remaining = usageRow && usageRow.rows.length > 0 ? parseInt(usageRow.rows[0].remaining) : (100 - count);
-  if (remaining <= 5) { console.log('API-Football limit approaching — conserving! Remaining:', remaining); return null; }
-  console.log('API-Football request #' + (count+1) + ' (' + remaining + ' remaining): ' + path);
-  return new Promise(function(resolve) {
-    var options = { hostname: 'v3.football.api-sports.io', path: path, method: 'GET', headers: { 'x-apisports-key': FOOTBALL_API_KEY } };
-    var req = https.request(options, function(res) {
-      var d = '';
-      res.on('data', function(c) { d += c; });
-      res.on('end', function() {
-        try {
-          // Read actual remaining quota from API-Football headers
-          var remaining = res.headers['x-ratelimit-requests-remaining'];
-          var limit = res.headers['x-ratelimit-requests-limit'];
-          if (remaining !== undefined) {
-            console.log('API-Football quota: ' + remaining + ' remaining of ' + limit);
-            incrementAPICount(parseInt(remaining));
-          } else {
-            incrementAPICount();
-          }
-          var result = JSON.parse(d);
-          if (result.errors && result.errors.requests) {
-            console.log('API-Football daily limit hit!');
-            incrementAPICount(0); // Mark as exhausted
-            resolve(null); return;
-          }
-          resolve(result);
-        } catch(e) { resolve(null); }
-      });
-    });
-    req.on('error', function() { resolve(null); });
-    setTimeout(function() { req.destroy(); resolve(null); }, 10000);
-    req.end();
-  });
-}
-
-// ============= FIX #2: ATOMIC event insert =============
-// Returns the new row ID if inserted (new event), null if already exists
-async function tryInsertEvent(eventKey, fixtureId, minute, type, player, team) {
-  try {
-    var result = await queryDB(
-      `INSERT INTO wp_processed_events (event_key, fixture_id, minute, event_type, player, team, status)
-       VALUES ($1,$2,$3,$4,$5,$6,'pending')
-       ON CONFLICT (event_key) DO NOTHING
-       RETURNING id`,
-      [eventKey, fixtureId, minute, type, player, team]
-    );
-    return result.rows.length > 0 ? result.rows[0].id : null;
-  } catch(e) { console.log('tryInsertEvent error:', e.message); return null; }
-}
-
-async function markEventSent(eventId, commentaryText, homeScore, awayScore) {
-  try {
-    await queryDB('UPDATE wp_processed_events SET status=$1, commentary_text=$2, home_score=$3, away_score=$4 WHERE id=$5',
-      ['sent', commentaryText, homeScore, awayScore, eventId]);
-  } catch(e) {}
-}
-
-async function markEventFailed(eventId) {
-  try { await queryDB("UPDATE wp_processed_events SET status='failed' WHERE id=$1", [eventId]); } catch(e) {}
-}
-
-// ============= SUBSCRIBERS =============
-async function getSubscribers() {
-  try {
-    var r = await queryDB('SELECT conversation_id, language, teams FROM wp_subscribers WHERE active=true');
-    return r.rows || [];
-  } catch(e) { return []; }
-}
-
-async function saveSubscriber(conversationId, language, teams) {
-  try {
-    await queryDB(`INSERT INTO wp_subscribers (conversation_id, language, teams, last_message_at)
-      VALUES ($1,$2,$3,NOW())
-      ON CONFLICT (conversation_id) DO UPDATE SET language=$2, teams=$3, active=true, last_message_at=NOW()`,
-      [conversationId, language, teams]);
-  } catch(e) { console.log('Save subscriber error:', e.message); }
-}
-
-async function removeSubscriber(conversationId) {
-  try { await queryDB('UPDATE wp_subscribers SET active=false WHERE conversation_id=$1', [conversationId]); } catch(e) {}
-}
-
-// ============= FIX #6: Get actual commentary history =============
-async function getRecentCommentary(fixtureId) {
-  try {
-    var r = await queryDB(
-      "SELECT commentary_text FROM wp_processed_events WHERE fixture_id=$1 AND status='sent' AND commentary_text IS NOT NULL ORDER BY processed_at DESC LIMIT 4",
-      [fixtureId]
-    );
-    return r.rows.map(function(row) { return row.commentary_text; }).filter(Boolean);
-  } catch(e) { return []; }
-}
-
-// ============= FIX #1: Reconstruct score from processed events =============
-async function getScoreAfterEvent(fixtureId, homeTeam, awayTeam, untilMinute) {
-  try {
-    var r = await queryDB(
-      "SELECT team, minute FROM wp_processed_events WHERE fixture_id=$1 AND event_type='Goal' AND status='sent' AND minute <= $2 ORDER BY minute ASC",
-      [fixtureId, untilMinute]
-    );
-    var homeScore = 0; var awayScore = 0;
-    r.rows.forEach(function(row) {
-      if (row.team === homeTeam) homeScore++;
-      else awayScore++;
-    });
-    return { homeScore: homeScore, awayScore: awayScore };
-  } catch(e) { return { homeScore: 0, awayScore: 0 }; }
-}
-
-// ============= SCOREBOARD SVG GENERATOR =============
-function generateScoreboardSVG(event, matchInfo, homeScore, awayScore) {
-  try {
-    var league = (matchInfo.league || 'Football').toUpperCase();
-    var home = (matchInfo.home || '').toUpperCase();
-    var away = (matchInfo.away || '').toUpperCase();
-    var score = homeScore + ' - ' + awayScore;
-    var player = event.player || '';
-    var minute = event.time || '?';
-    var eventEmoji = event.type === 'Goal' ? 'GOAL' : 'RED CARD';
-
-    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400">' +
-      '<defs>' +
-      '<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">' +
-      '<stop offset="0%" stop-color="#0a0a1a"/>' +
-      '<stop offset="100%" stop-color="#1a1a3e"/>' +
-      '</linearGradient>' +
-      '</defs>' +
-      '<rect width="800" height="400" fill="url(#bg)"/>' +
-      '<rect y="340" width="800" height="60" fill="#1a5c2e"/>' +
-      '<rect x="0" y="340" width="80" height="60" fill="#1e6b35"/>' +
-      '<rect x="160" y="340" width="80" height="60" fill="#1e6b35"/>' +
-      '<rect x="320" y="340" width="80" height="60" fill="#1e6b35"/>' +
-      '<rect x="480" y="340" width="80" height="60" fill="#1e6b35"/>' +
-      '<rect x="640" y="340" width="80" height="60" fill="#1e6b35"/>' +
-      '<text x="400" y="45" text-anchor="middle" font-family="Arial" font-size="20" font-weight="bold" fill="rgba(255,255,255,0.6)">' + league + '</text>' +
-      '<text x="270" y="155" text-anchor="end" font-family="Arial" font-size="40" font-weight="bold" fill="white">' + home + '</text>' +
-      '<text x="530" y="155" text-anchor="start" font-family="Arial" font-size="40" font-weight="bold" fill="white">' + away + '</text>' +
-      '<rect x="310" y="100" width="180" height="80" rx="12" fill="rgba(255,255,255,0.1)"/>' +
-      '<text x="400" y="165" text-anchor="middle" font-family="Arial" font-size="56" font-weight="bold" fill="#FFD700">' + score + '</text>' +
-      '<text x="400" y="220" text-anchor="middle" font-family="Arial" font-size="22" fill="#25D366">⚽ ' + minute + "' " + player + '</text>' +
-      '<line x1="100" y1="245" x2="700" y2="245" stroke="rgba(255,255,255,0.2)" stroke-width="1"/>' +
-      '<text x="400" y="285" text-anchor="middle" font-family="Arial" font-size="18" font-weight="bold" fill="#25D366">⚡ WatchParty AI</text>' +
-      '<text x="400" y="315" text-anchor="middle" font-family="Arial" font-size="14" fill="rgba(255,255,255,0.4)">Football kwa East Africa</text>' +
-      '</svg>';
-
-    return Buffer.from(svg);
-  } catch(e) {
-    console.log('SVG error:', e.message);
-    return null;
+    await c.connect();
+    const r = await c.query(sql, params);
+    await c.end();
+    return r;
+  } catch (e) {
+    try { await c.end(); } catch {}
+    throw e;
   }
 }
 
-async function sendSVGChatwoot(conversationId, svgBuffer, caption) {
-  return new Promise(function(resolve) {
-    var boundary = 'boundary' + Date.now();
-    var CRLF = '\r\n';
-    var captionPart = '--' + boundary + CRLF + 'Content-Disposition: form-data; name="content"' + CRLF + CRLF + (caption || '') + CRLF;
-    var filePart = '--' + boundary + CRLF + 'Content-Disposition: form-data; name="attachments[]"; filename="scoreboard.svg"' + CRLF + 'Content-Type: image/svg+xml' + CRLF + CRLF;
-    var endPart = CRLF + '--' + boundary + '--' + CRLF;
-    var body = Buffer.concat([Buffer.from(captionPart), Buffer.from(filePart), svgBuffer, Buffer.from(endPart)]);
-    var options = {
-      hostname: CHATWOOT_URL, path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages', method: 'POST',
-      headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length }
-    };
-    var req = https.request(options, function(res) {
-      var d = ''; res.on('data', function(c) { d += c; });
-      res.on('end', function() { resolve(res.statusCode >= 200 && res.statusCode < 300); });
-    });
-    req.on('error', function() { resolve(false); });
-    req.write(body); req.end();
-  });
-}
-
-async function sendSVGChatwoot(conversationId, imageBuffer, caption) {
-  return new Promise(function(resolve) {
-    var boundary = 'boundary' + Date.now();
-    var captionField = '--' + boundary + '\r\nContent-Disposition: form-data; name="content"\r\n\r\n' + (caption || '') + '\r\n';
-    var header = '--' + boundary + '\r\nContent-Disposition: form-data; name="attachments[]"; filename="scoreboard.png"\r\nContent-Type: image/png\r\n\r\n';
-    var footer = '\r\n--' + boundary + '--\r\n';
-    var body = Buffer.concat([Buffer.from(captionField), Buffer.from(header), imageBuffer, Buffer.from(footer)]);
-    var options = {
-      hostname: CHATWOOT_URL, path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages', method: 'POST',
-      headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length }
-    };
-    var req = https.request(options, function(res) {
-      var d = '';
-      res.on('data', function(c) { d += c; });
-      res.on('end', function() {
-        var ok = res.statusCode >= 200 && res.statusCode < 300;
-        console.log('Scoreboard image sent:', res.statusCode);
-        resolve(ok);
-      });
-    });
-    req.on('error', function(e) { console.log('Image send error:', e.message); resolve(false); });
-    req.write(body); req.end();
-  });
-}
-
-// ============= CHATWOOT =============
-function sendChatwootMessage(conversationId, content) {
-  return new Promise(function(resolve) {
-    var body = JSON.stringify({ content: content, message_type: 'outgoing', private: false });
-    var options = { hostname: CHATWOOT_URL, path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages', method: 'POST', headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'application/json', 'content-length': Buffer.byteLength(body) } };
-    var req = https.request(options, function(res) {
-      var d = '';
-      res.on('data', function(c) { d += c; });
-      res.on('end', function() {
-        var ok = res.statusCode >= 200 && res.statusCode < 300;
-        if (!ok) console.log('Chatwoot delivery failed:', res.statusCode, 'conv:', conversationId);
-        resolve(ok);
-      });
-    });
-    req.on('error', function(e) { console.log('Chatwoot error:', e.message); resolve(false); });
-    setTimeout(function() { req.destroy(); resolve(false); }, 10000);
-    req.write(body); req.end();
-  });
-}
-
-function sendVoiceChatwoot(conversationId, audioBuffer) {
-  return new Promise(function(resolve) {
-    var boundary = 'boundary' + Date.now();
-    var chatField = '--' + boundary + '\r\nContent-Disposition: form-data; name="content"\r\n\r\nVoice reaction\r\n';
-    var header = '--' + boundary + '\r\nContent-Disposition: form-data; name="attachments[]"; filename="reaction.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n';
-    var footer = '\r\n--' + boundary + '--\r\n';
-    var body = Buffer.concat([Buffer.from(chatField), Buffer.from(header), audioBuffer, Buffer.from(footer)]);
-    var options = { hostname: CHATWOOT_URL, path: '/api/v1/accounts/1/conversations/' + conversationId + '/messages', method: 'POST', headers: { 'api_access_token': CHATWOOT_TOKEN, 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length } };
-    var req = https.request(options, function(res) { var d = ''; res.on('data', function(c){ d+=c; }); res.on('end', function() { resolve(res.statusCode === 200 || res.statusCode === 201); }); });
-    req.on('error', function() { resolve(false); });
-    req.write(body); req.end();
-  });
-}
-
-// ============= ELEVENLABS — FIX #7: aliases =============
-var elevenLabsDictId = null;
-async function setupElevenLabsAlias() {
-  if (!ELEVENLABS_KEY) return null;
+// ========= API CLIENTS =========
+async function goal(path) {
+  if (!GOAL_API_KEY || Date.now() < goalBackoffUntil) return null;
   try {
-    // Check if dictionary already exists
-    var listResult = await new Promise(function(resolve) {
-      var options = { hostname: 'api.elevenlabs.io', path: '/v1/pronunciation-dictionaries', method: 'GET', headers: { 'xi-api-key': ELEVENLABS_KEY } };
-      var req = https.request(options, function(res) { var d=''; res.on('data',function(c){d+=c;}); res.on('end',function(){try{resolve(JSON.parse(d));}catch(e){resolve(null);}}); });
-      req.on('error', function(){resolve(null);}); req.end();
+    const r = await requestJson("api.goal-api.com", "/v1" + path, {
+      "Authorization": `Bearer ${GOAL_API_KEY}`,
+      "Content-Type": "application/json"
     });
-    if (listResult && listResult.pronunciation_dictionaries) {
-      var existing = listResult.pronunciation_dictionaries.find(function(d) { return d.name === 'watchparty_kenyan'; });
-      if (existing) { elevenLabsDictId = existing.id; console.log('ElevenLabs dict reused:', elevenLabsDictId); return elevenLabsDictId; }
+    const remaining = Number(r.headers["x-ratelimit-remaining"] || r.headers["x-ratelimit-requests-remaining"]);
+    if (Number.isFinite(remaining)) {
+      console.log("GOAL quota remaining:", remaining);
+      if (remaining <= 5) goalBackoffUntil = Date.now() + 60 * 60 * 1000;
     }
-    // Create new dictionary
-    var rules = [
-      { type: 'alias', string_to_replace: 'Yooo', alias: 'Yo' },
-      { type: 'alias', string_to_replace: 'YOOO', alias: 'Yo' },
-      { type: 'alias', string_to_replace: 'Weh', alias: 'Weh' },
-      { type: 'alias', string_to_replace: 'Aii', alias: 'Ay' },
-      { type: 'alias', string_to_replace: 'Bana', alias: 'Barna' },
-      { type: 'alias', string_to_replace: 'Eeh', alias: 'Eeh' }
-    ];
-    var body = JSON.stringify({ name: 'watchparty_kenyan', description: 'WatchParty Kenyan football reactions', rules: rules });
-    var createResult = await new Promise(function(resolve) {
-      var options = { hostname: 'api.elevenlabs.io', path: '/v1/pronunciation-dictionaries', method: 'POST', headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } };
-      var req = https.request(options, function(res) { var d=''; res.on('data',function(c){d+=c;}); res.on('end',function(){try{resolve(JSON.parse(d));}catch(e){resolve(null);}}); });
-      req.on('error', function(){resolve(null);}); req.write(body); req.end();
-    });
-    if (createResult && createResult.id) {
-      elevenLabsDictId = createResult.id;
-      console.log('ElevenLabs dict created:', elevenLabsDictId);
-      return elevenLabsDictId;
+    if (r.status === 429) {
+      goalBackoffUntil = Date.now() + Math.max(60, Number(r.headers["retry-after"]) || 60) * 1000;
+      console.log("GOAL API 429 — backing off");
+      return null;
     }
-  } catch(e) { console.log('ElevenLabs alias error:', e.message); }
+    if (r.status < 200 || r.status >= 300) { console.log("GOAL API", path, "HTTP", r.status); return null; }
+    return r.body;
+  } catch (e) { console.log("GOAL API error:", e.message); return null; }
+}
+
+async function football(path) {
+  if (!FOOTBALL_API_KEY || Date.now() < footballBackoffUntil) return null;
+  try {
+    const r = await requestJson("v3.football.api-sports.io", path, { "x-apisports-key": FOOTBALL_API_KEY });
+    const daily = Number(r.headers["x-ratelimit-requests-remaining"]);
+    const minute = Number(r.headers["x-ratelimit-remaining"]);
+    if (Number.isFinite(daily)) console.log("API-Football daily remaining:", daily);
+    if (Number.isFinite(minute) && minute <= 1) footballBackoffUntil = Date.now() + 60 * 1000;
+    if (r.status === 429) {
+      footballBackoffUntil = Date.now() + Math.max(60, Number(r.headers["retry-after"]) || 60) * 1000;
+      console.log("API-Football 429 — backing off");
+      return null;
+    }
+    if (r.status < 200 || r.status >= 300) { console.log("API-Football", path, "HTTP", r.status); return null; }
+    return r.body;
+  } catch (e) { console.log("API-Football error:", e.message); return null; }
+}
+
+// ========= NORMALIZATION =========
+function goalMatch(x) {
+  const h = x.homeTeam || {};
+  const a = x.awayTeam || {};
+  const l = x.league || {};
+  const id = String(x.id || x.fixtureId || x.matchId || "");
+  if (!id) return null;
+  return {
+    fixtureId: id,
+    homeId: String(h.id || h.teamId || ""),
+    awayId: String(a.id || a.teamId || ""),
+    home: String(h.name || x.homeTeamName || "Home"),
+    away: String(a.name || x.awayTeamName || "Away"),
+    leagueId: String(l.id || l.leagueId || ""),
+    league: String(l.name || x.leagueName || "Football"),
+    country: String(l.country?.name || l.country || x.country || ""),
+    status: String(x.matchStatus || x.status || ""),
+    homeScore: Number(x.homeScore ?? x.score?.home ?? 0) || 0,
+    awayScore: Number(x.awayScore ?? x.score?.away ?? 0) || 0,
+    kickoffUtc: x.kickoffUtc || null
+  };
+}
+
+function goalEvent(x, match) {
+  const type = norm(x.type || x.eventType || "");
+  let eventType = null;
+  if (type === "goal" || type === "score") eventType = "Goal";
+  if (type === "red card" || type === "red_card") eventType = "Card";
+  if (!eventType) return null;
+  const home = !!x.homeScorer;
+  const score = String(x.score || "0 - 0").split("-").map(v => Number(v.trim()));
+  return {
+    type: eventType,
+    detail: x.detail || x.type,
+    player: String(x.homeScorer || x.awayScorer || x.player?.name || x.player || "").replace(/\s*\(o\.g\.\)/i, "").trim(),
+    playerId: String(x.playerId || x.player?.id || ""),
+    team: home ? match.home : match.away,
+    teamId: home ? match.homeId : match.awayId,
+    minute: Number(x.time || x.elapsed || 0) || 0,
+    extra: Number(x.extra || 0) || 0,
+    homeAfter: Number.isFinite(score[0]) ? score[0] : null,
+    awayAfter: Number.isFinite(score[1]) ? score[1] : null,
+    assist: x.assist?.name || x.assist || null
+  };
+}
+
+function footballEvent(x) {
+  const type = norm(x.type || "");
+  const detail = norm(x.detail || "");
+  let eventType = null;
+  if (type === "goal") eventType = "Goal";
+  if (detail === "red card" || detail === "second yellow card") eventType = "Card";
+  if (!eventType) return null;
+  return {
+    type: eventType, detail: x.detail || x.type,
+    player: String(x.player?.name || ""), playerId: String(x.player?.id || ""),
+    team: String(x.team?.name || ""), teamId: String(x.team?.id || ""),
+    minute: Number(x.time?.elapsed || 0), extra: Number(x.time?.extra || 0),
+    homeAfter: null, awayAfter: null, assist: x.assist?.name || null
+  };
+}
+
+// ========= DATABASE =========
+async function saveMatch(m) {
+  await db(`
+    INSERT INTO wp_matches (fixture_id,league_name,country,home_team,away_team,status,home_score,away_score,kickoff,kickoff_utc,home_team_id,away_team_id,last_checked)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11,NOW())
+    ON CONFLICT (fixture_id) DO UPDATE SET
+      league_name=EXCLUDED.league_name, country=EXCLUDED.country,
+      home_team=EXCLUDED.home_team, away_team=EXCLUDED.away_team,
+      status=EXCLUDED.status, home_score=EXCLUDED.home_score,
+      away_score=EXCLUDED.away_score, kickoff=EXCLUDED.kickoff,
+      kickoff_utc=EXCLUDED.kickoff_utc, home_team_id=EXCLUDED.home_team_id,
+      away_team_id=EXCLUDED.away_team_id, last_checked=NOW()
+  `, [m.fixtureId, m.league, m.country, m.home, m.away, m.status,
+      m.homeScore, m.awayScore, m.kickoffUtc ? new Date(m.kickoffUtc) : null,
+      m.homeId || null, m.awayId || null]);
+}
+
+async function schemaCheck() {
+  const names = ["wp_subscribers","wp_subscriber_teams","wp_subscriber_preferences",
+    "wp_matches","wp_processed_events","wp_match_narrative","wp_match_context",
+    "wp_derby_database","wp_teams","wp_players","wp_player_seasons",
+    "wp_player_transfers","wp_predictions","wp_watchparty_iq","wp_delivery_log"];
+  const r = await db(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name=ANY($1::text[])`, [names]);
+  const found = new Set(r.rows.map(x => x.table_name));
+  const missing = names.filter(x => !found.has(x));
+  if (missing.length) throw new Error("Missing tables: " + missing.join(", "));
+  console.log("V1 database: 15/15 tables OK");
+}
+
+// ========= SUBSCRIBERS =========
+async function followedTeams() {
+  const r = await db(`
+    SELECT DISTINCT st.team_id, st.team_name FROM wp_subscriber_teams st
+    JOIN wp_subscribers s ON s.conversation_id = st.subscriber_id WHERE s.active=true
+  `);
+  return r.rows;
+}
+
+async function myTeams(conversationId) {
+  const r = await db(`SELECT team_id, team_name FROM wp_subscriber_teams WHERE subscriber_id=$1 ORDER BY team_name`, [conversationId]);
+  return r.rows;
+}
+
+async function activate(conversationId) {
+  await db(`
+    INSERT INTO wp_subscribers (conversation_id, language, active, last_active_at, last_message_at)
+    VALUES ($1,'english',true,NOW(),NOW())
+    ON CONFLICT (conversation_id) DO UPDATE SET active=true, last_active_at=NOW(), last_message_at=NOW()
+  `, [conversationId]);
+  await db(`INSERT INTO wp_subscriber_preferences (subscriber_id) VALUES ($1) ON CONFLICT DO NOTHING`, [conversationId]);
+}
+
+async function follow(conversationId, team) {
+  await activate(conversationId);
+  await db(`
+    INSERT INTO wp_subscriber_teams (subscriber_id, team_name, team_id)
+    VALUES ($1,$2,$3) ON CONFLICT (subscriber_id,team_name)
+    DO UPDATE SET team_id=COALESCE(EXCLUDED.team_id, wp_subscriber_teams.team_id)
+  `, [conversationId, team.name, team.id || null]);
+}
+
+async function stop(conversationId) {
+  await db(`UPDATE wp_subscribers SET active=false, last_active_at=NOW() WHERE conversation_id=$1`, [conversationId]);
+}
+
+// ========= TEAM RESOLUTION =========
+const COMMON = {
+  "arsenal":"Arsenal","chelsea":"Chelsea","liverpool":"Liverpool",
+  "manchester united":"Manchester United","man united":"Manchester United",
+  "manchester city":"Manchester City","man city":"Manchester City",
+  "tottenham":"Tottenham","spurs":"Tottenham","newcastle":"Newcastle United",
+  "everton":"Everton","aston villa":"Aston Villa","west ham":"West Ham United",
+  "fulham":"Fulham","brentford":"Brentford","brighton":"Brighton",
+  "crystal palace":"Crystal Palace","palace":"Crystal Palace",
+  "bournemouth":"Bournemouth","nottingham forest":"Nottingham Forest",
+  "forest":"Nottingham Forest","wolves":"Wolverhampton Wanderers"
+};
+
+async function resolveTeam(text) {
+  const wanted = COMMON[norm(text)] || text.trim();
+  const r = await goal("/teams?search=" + encodeURIComponent(wanted));
+  if (r?.data && Array.isArray(r.data)) {
+    const candidates = r.data.map(t => ({
+      id: String(t.id || t.teamId || ""),
+      name: String(t.name || t.teamName || ""),
+      country: String(t.country?.name || t.country || "")
+    })).filter(t => t.id && t.name);
+    const exact = candidates.find(t => norm(t.name) === norm(wanted));
+    if (exact) return exact;
+    if (candidates[0]) return candidates[0];
+  }
+  if (COMMON[norm(text)]) return { id: null, name: COMMON[norm(text)], country: "England" };
   return null;
 }
 
-function textToVoiceElevenLabs(text) {
-  return new Promise(function(resolve) {
-    if (!ELEVENLABS_KEY) { resolve(null); return; }
-    var cleanText = text.replace(/[^\x00-\x7F]/g, '').replace(/\*\*/g, '').replace(/#\w+/g, '').trim();
-    if (cleanText.length > 250) cleanText = cleanText.substring(0, 250);
-    if (!cleanText || cleanText.length < 5) { resolve(null); return; }
-    var ttsPayload = { text: cleanText, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.45, similarity_boost: 0.80, style: 0.00, speed: 0.88, use_speaker_boost: true } };
-    if (elevenLabsDictId) { ttsPayload.pronunciation_dictionary_locators = [{ pronunciation_dictionary_id: elevenLabsDictId, version_id: 'latest' }]; }
-    var body = JSON.stringify(ttsPayload);
-    var options = { hostname: 'api.elevenlabs.io', path: '/v1/text-to-speech/' + ELEVENLABS_VOICE_ID, method: 'POST', headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg', 'Content-Length': Buffer.byteLength(body) } };
-    var req = https.request(options, function(res) {
-      var chunks = [];
-      res.on('data', function(c) { chunks.push(c); });
-      res.on('end', function() { resolve(res.statusCode === 200 ? Buffer.concat(chunks) : null); });
-    });
-    req.on('error', function() { resolve(null); });
-    setTimeout(function() { req.destroy(); resolve(null); }, 20000);
-    req.write(body); req.end();
+// ========= UPCOMING FIXTURES =========
+async function upcomingForTeam(team) {
+  if (!team.team_id) return [];
+  const r = await goal(`/teams/${encodeURIComponent(team.team_id)}/upcoming`);
+  if (r?.data && Array.isArray(r.data)) {
+    return r.data.map(goalMatch).filter(Boolean).filter(m => allowedCompetition(m.league)).slice(0,5);
+  }
+  return [];
+}
+
+async function showUpcoming(conversationId) {
+  const teams = await myTeams(conversationId);
+  if (!teams.length) {
+    return sendChatwoot(conversationId, "You are not following a team yet.\n\nTry: WATCH ARSENAL");
+  }
+  const all = [];
+  for (const t of teams) {
+    const fixtures = await upcomingForTeam(t);
+    for (const m of fixtures) all.push(m);
+  }
+  const unique = [...new Map(all.map(m => [m.fixtureId, m])).values()]
+    .sort((a,b) => new Date(a.kickoffUtc || 0) - new Date(b.kickoffUtc || 0))
+    .slice(0,5);
+  if (!unique.length) {
+    return sendChatwoot(conversationId, "I couldn't find upcoming fixtures right now. Try MATCHES again shortly.");
+  }
+  let msg = "⚽ YOUR UPCOMING MATCHES\n\n";
+  for (const m of unique) {
+    await saveMatch(m);
+    const time = m.kickoffUtc ? new Date(m.kickoffUtc).toLocaleString("en-KE", {
+      timeZone:"Africa/Nairobi", weekday:"short", day:"numeric", month:"short", hour:"numeric", minute:"2-digit"
+    }) : "Kickoff TBC";
+    msg += `${m.home} vs ${m.away}\n${time} Nairobi\n${m.league}\n\n`;
+  }
+  await sendChatwoot(conversationId, msg.trim());
+}
+
+// ========= LIVE DISCOVERY =========
+async function liveFixturesForTeam(team) {
+  if (!team.team_id) return [];
+  const r = await goal(`/teams/${encodeURIComponent(team.team_id)}/fixtures`);
+  if (!r?.data || !Array.isArray(r.data)) return [];
+  return r.data.map(goalMatch).filter(Boolean).filter(m => allowedCompetition(m.league)).filter(m => {
+    const s = norm(m.status);
+    return s.includes("live") || s.includes("half") || s.includes("1h") || s.includes("2h") || s === "ht" || s === "et";
   });
 }
 
-function textToVoiceAzure(text) {
-  return new Promise(function(resolve) {
-    if (!AZURE_KEY) { resolve(null); return; }
-    var cleanText = text.replace(/[^\x00-\x7F]/g, '').replace(/\*\*/g, '').trim();
-    if (!cleanText || cleanText.length < 5) { resolve(null); return; }
-    var ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="sw-KE"><voice name="sw-KE-RafikiNeural"><prosody rate="1.1">' + cleanText + '</prosody></voice></speak>';
-    var options = { hostname: AZURE_REGION + '.tts.speech.microsoft.com', path: '/cognitiveservices/v1', method: 'POST', headers: { 'Ocp-Apim-Subscription-Key': AZURE_KEY, 'Content-Type': 'application/ssml+xml', 'X-Microsoft-OutputFormat': 'audio-16khz-128kbitrate-mono-mp3', 'User-Agent': 'WatchPartyAI', 'Content-Length': Buffer.byteLength(ssml) } };
-    var req = https.request(options, function(res) { var chunks = []; res.on('data', function(c) { chunks.push(c); }); res.on('end', function() { resolve(res.statusCode === 200 ? Buffer.concat(chunks) : null); }); });
-    req.on('error', function() { resolve(null); });
-    setTimeout(function() { req.destroy(); resolve(null); }, 15000);
-    req.write(ssml); req.end();
-  });
+async function discoverLive() {
+  const teams = await followedTeams();
+  if (!teams.length) {
+    console.log("No subscribers -> ZERO live football API polling");
+    liveMatches.clear();
+    return [];
+  }
+  const unique = new Map();
+  for (const t of teams) {
+    const matches = await liveFixturesForTeam(t);
+    for (const m of matches) unique.set(m.fixtureId, m);
+  }
+  const matches = [...unique.values()];
+  for (const m of matches) {
+    await saveMatch(m);
+    liveMatches.set(m.fixtureId, m);
+    if (!nextEventPoll.has(m.fixtureId)) nextEventPoll.set(m.fixtureId, 0);
+  }
+  const ids = new Set(matches.map(m => m.fixtureId));
+  for (const id of liveMatches.keys()) {
+    if (!ids.has(id)) { liveMatches.delete(id); nextEventPoll.delete(id); queues.delete(id); }
+  }
+  console.log("Live discovery:", matches.length, "followed match(es) monitored");
+  return matches;
 }
 
-// ============= CLAUDE COMMENTARY =============
-async function generateCommentary(eventContext, language, recentCommentary) {
-  var historyNote = recentCommentary.length > 0
-    ? '\n\nPrevious reactions you sent (AVOID repeating same words/style):\n' + recentCommentary.join('\n')
-    : '';
+// ========= EVENT INGESTION =========
+function eventKey(fixtureId, e) {
+  return [fixtureId, e.type, e.minute, e.extra, e.teamId || norm(e.team), e.playerId || norm(e.player), norm(e.detail)].join("|");
+}
 
-  var prompt = 'WATCHPARTY REACTION ENGINE\n\n' +
-    'MATCH FACTS:\n' +
-    'Competition: ' + eventContext.competition + '\n' +
-    eventContext.home + ' ' + eventContext.homeScore + '-' + eventContext.awayScore + ' ' + eventContext.away + '\n' +
-    'Event: ' + eventContext.eventType + ' - ' + eventContext.scorer + ' (' + eventContext.minute + 'min)\n' +
-    'Situation: ' + eventContext.situation + '\n' +
-    historyNote + '\n\n' +
-    'Generate TWO versions:\n' +
-    'TEXT: [1-2 sentences, include score, 0-2 emojis, natural Sheng/Swahili/English mix]\n' +
-    'VOICE: [7-9 seconds spoken, REACTION only - text already shows score, write numbers as words like one-nil, add SSML breaks like <break time=\"0.35s\" /> between sentences, no emojis]\n\n' +
-    'RULES: Vary opening: Yo! Weh! Aii! Nah bro! NEVER invent goalkeeper/tactics. Language: ' + language;
+async function insertNewEvent(match, e) {
+  const key = eventKey(match.fixtureId, e);
+  const r = await db(`
+    INSERT INTO wp_processed_events (event_key,fixture_id,minute,extra_minute,event_type,player,player_id,team,team_id,assist,status,processed_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',NOW())
+    ON CONFLICT (event_key) DO NOTHING RETURNING id
+  `, [key, match.fixtureId, e.minute, e.extra, e.type, e.player||null, e.playerId||null, e.team||null, e.teamId||null, e.assist||null]);
+  return r.rows[0] ? { id: r.rows[0].id, key } : null;
+}
 
-  var body = JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 100, messages: [{ role: 'user', content: prompt }] });
-  var options = { hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } };
-  return new Promise(function(resolve) {
-    var req = https.request(options, function(res) {
-      var d = '';
-      res.on('data', function(c) { d += c; });
-      res.on('end', function() {
-        try { var r = JSON.parse(d); resolve(r.content && r.content[0] ? r.content[0].text.trim() : ''); }
-        catch(e) { resolve(''); }
+// ========= SCORE RECONSTRUCTION =========
+async function matchScoreFromEvents(match) {
+  const r = await db(`
+    SELECT event_type, team, team_id FROM wp_processed_events
+    WHERE fixture_id=$1 AND status IN ('pending','sent') AND event_type='Goal'
+    ORDER BY minute, extra_minute, id
+  `, [match.fixtureId]);
+  let home = 0, away = 0;
+  for (const e of r.rows) {
+    if ((e.team_id && match.homeId && String(e.team_id) === String(match.homeId)) || norm(e.team) === norm(match.home)) home++;
+    else away++;
+  }
+  return { home, away };
+}
+
+// ========= MATCH SITUATION =========
+function situation(before, after, e) {
+  if (after.home + after.away === 1) return "OPENING_GOAL";
+  if ((before.home > before.away && after.home === after.away) || (before.away > before.home && after.home === after.away)) return "EQUALIZER";
+  if (before.home === before.away && after.home !== after.away) return "GO_AHEAD_GOAL";
+  if (e.minute >= 75) return "LATE_GOAL";
+  if (Math.abs(after.home - after.away) >= 2) return "TWO_GOAL_LEAD";
+  return e.type === "Card" ? "RED_CARD" : "GOAL";
+}
+
+// ========= DERBY =========
+async function derby(match) {
+  const r = await db(`
+    SELECT derby_name FROM wp_derby_database
+    WHERE (LOWER(team1)=LOWER($1) AND LOWER(team2)=LOWER($2))
+       OR (LOWER(team1)=LOWER($2) AND LOWER(team2)=LOWER($1)) LIMIT 1
+  `, [match.home, match.away]);
+  return r.rows[0]?.derby_name || null;
+}
+
+// ========= PROCESS EVENT =========
+async function processEvent(match, e, row) {
+  const before = await matchScoreFromEvents(match);
+  let after = { ...before };
+  if (e.type === "Goal") {
+    if (e.teamId && match.homeId && String(e.teamId) === String(match.homeId)) after.home++;
+    else after.away++;
+    if (e.homeAfter !== null && e.awayAfter !== null) { after.home = e.homeAfter; after.away = e.awayAfter; }
+  }
+  const sit = situation(before, after, e);
+  const derbyName = await derby(match);
+  const message = `${e.type === "Goal" ? "⚽" : "🟥"} ${match.league}\n` +
+    `${match.home} ${after.home}–${after.away} ${match.away}\n` +
+    `${e.minute}${e.extra ? "+" + e.extra : ""}\'` +
+    `${e.player ? " — " + e.player : ""}` +
+    `${derbyName ? "\n🔥 " + derbyName : ""}`;
+
+  const r = await db(`
+    SELECT s.conversation_id FROM wp_subscribers s
+    JOIN wp_subscriber_teams st ON st.subscriber_id = s.conversation_id
+    WHERE s.active=true AND (
+      (st.team_id IS NOT NULL AND st.team_id IN ($1,$2)) OR
+      (st.team_id IS NULL AND LOWER(st.team_name) IN (LOWER($3),LOWER($4)))
+    )
+  `, [match.homeId||"", match.awayId||"", match.home, match.away]);
+
+  let sent = 0;
+  for (const sub of r.rows) {
+    const ok = await sendChatwoot(sub.conversation_id, message);
+    await db(`INSERT INTO wp_delivery_log (subscriber_id,fixture_id,event_key,text_sent,text_delivered) VALUES ($1,$2,$3,true,$4)`,
+      [sub.conversation_id, match.fixtureId, row.key, ok]).catch(() => {});
+    if (ok) sent++;
+    await sleep(200);
+  }
+
+  if (sent) {
+    await db(`UPDATE wp_processed_events SET status='sent', commentary_text=$1, home_score=$2, away_score=$3, score_home_before=$4, score_away_before=$5, score_home_after=$6, score_away_after=$7, emotion_level=$8, processed_at=NOW() WHERE id=$9`,
+      [message, after.home, after.away, before.home, before.away, after.home, after.away,
+       e.minute >= 75 ? 0.95 : sit === "EQUALIZER" ? 0.85 : 0.65, row.id]);
+  } else {
+    await db(`UPDATE wp_processed_events SET status='failed' WHERE id=$1`, [row.id]);
+  }
+}
+
+// ========= EVENT QUEUE =========
+function queueEvent(match, e, row) {
+  const id = match.fixtureId;
+  const previous = queues.get(id) || Promise.resolve();
+  const next = previous.then(() => processEvent(match, e, row)).catch(async err => {
+    console.log("Event processing error:", err.message);
+    await db(`UPDATE wp_processed_events SET status='failed' WHERE id=$1`, [row.id]).catch(() => {});
+  });
+  queues.set(id, next);
+}
+
+// ========= POLL EVENTS =========
+async function pollEvents(match) {
+  if (Date.now() < (nextEventPoll.get(match.fixtureId) || 0)) return;
+  let events = [];
+  const r = await goal(`/fixtures/${encodeURIComponent(match.fixtureId)}/events`);
+  if (r?.data && Array.isArray(r.data)) {
+    events = r.data.map(x => goalEvent(x, match)).filter(Boolean);
+  }
+  if (!events.length && FOOTBALL_API_KEY) {
+    const f = await football(`/fixtures/events?fixture=${encodeURIComponent(match.fixtureId)}`);
+    if (f?.response && Array.isArray(f.response)) {
+      events = f.response.map(x => footballEvent(x)).filter(Boolean);
+    }
+  }
+  events.sort((a,b) => (a.minute + a.extra/100) - (b.minute + b.extra/100));
+  for (const e of events) {
+    const row = await insertNewEvent(match, e);
+    if (row) {
+      console.log("NEW EVENT", match.home, "vs", match.away, e.type, e.minute, e.player);
+      queueEvent(match, e, row);
+    }
+  }
+  nextEventPoll.set(match.fixtureId, Date.now() + 45 * 1000);
+}
+
+// ========= MAIN POLLER =========
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const matches = await discoverLive();
+    for (const m of matches) { await pollEvents(m); await sleep(250); }
+  } catch (e) { console.log("Poll error:", e.message); }
+  finally { polling = false; }
+}
+
+// ========= NO OLD EVENT FLOOD =========
+async function closeOldPending() {
+  await db(`UPDATE wp_processed_events SET status='failed' WHERE status='pending' AND processed_at < NOW() - INTERVAL '5 minutes'`);
+  console.log("Old pending events closed; none will be replayed on restart.");
+}
+
+// ========= CHATWOOT =========
+function sendChatwoot(conversationId, content) {
+  return new Promise(resolve => {
+    const body = JSON.stringify({ content, message_type: "outgoing", private: false });
+    const req = https.request({
+      hostname: CHATWOOT_URL,
+      path: `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${encodeURIComponent(conversationId)}/messages`,
+      method: "POST",
+      headers: { "api_access_token": CHATWOOT_TOKEN, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }
+    }, res => {
+      let d = "";
+      res.on("data", c => d += c);
+      res.on("end", () => {
+        const ok = res.statusCode >= 200 && res.statusCode < 300;
+        if (!ok) console.log("Chatwoot", res.statusCode, d.slice(0,200));
+        resolve(ok);
       });
     });
-    req.on('error', function() { resolve(''); });
-    setTimeout(function() { req.destroy(); resolve(''); }, 15000);
-    req.write(body); req.end();
+    req.on("error", e => { console.log("Chatwoot error:", e.message); resolve(false); });
+    req.write(body);
+    req.end();
   });
 }
 
-// ============= FIX #4+#5: ONE video job per event =============
-async function createVideoJob(eventKey, fixtureId, homeTeam, awayTeam, goalMinute) {
-  try {
-    await queryDB(
-      `INSERT INTO wp_video_jobs (event_key, fixture_id, home_team, away_team, goal_minute, status, next_retry)
-       VALUES ($1,$2,$3,$4,$5,'pending',NOW())
-       ON CONFLICT (event_key) DO NOTHING`,
-      [eventKey, fixtureId, homeTeam, awayTeam, goalMinute || 0]
-    );
-  } catch(e) { console.log('createVideoJob error:', e.message); }
-}
-
-async function processVideJobs() {
-  try {
-    var jobs = await queryDB(
-      "SELECT * FROM wp_video_jobs WHERE status='pending' AND next_retry <= NOW() AND attempt < 4"
-    );
-    for (var i = 0; i < jobs.rows.length; i++) {
-      var job = jobs.rows[i];
-      var videoUrl = null;
-
-      // Try Highlightly
-      try {
-        var hlResult = await new Promise(function(resolve) {
-          var options = { hostname: 'soccer.highlightly.net', path: '/matches/' + job.fixture_id + '/highlights', method: 'GET', headers: { 'x-rapidapi-key': HIGHLIGHTLY_KEY } };
-          var req = https.request(options, function(res) { var d=''; res.on('data',function(c){d+=c;}); res.on('end',function(){try{resolve(JSON.parse(d));}catch(e){resolve(null);}}); });
-          req.on('error', function(){resolve(null);}); setTimeout(function(){req.destroy();resolve(null);},10000); req.end();
-        });
-        if (hlResult && Array.isArray(hlResult) && hlResult.length > 0) {
-          // Match to specific goal minute using job.goal_minute
-          var candidate = hlResult.find(function(h) { return h.minute && Math.abs(h.minute - job.goal_minute) < 5; }) || hlResult[0];
-          videoUrl = candidate && (candidate.url || candidate.videoUrl || candidate.embedUrl);
-        }
-      } catch(e) {}
-
-      // Try ScoreBat if no video
-      if (!videoUrl) {
-        try {
-          var q = encodeURIComponent(job.home_team + ' ' + job.away_team);
-          var sbResult = await new Promise(function(resolve) {
-            var options = { hostname: 'www.scorebat.com', path: '/video-api/v3/feed/?token=free&q=' + q, method: 'GET', headers: { 'Accept': 'application/json' } };
-            var req = https.request(options, function(res) { var d=''; res.on('data',function(c){d+=c;}); res.on('end',function(){try{resolve(JSON.parse(d));}catch(e){resolve(null);}}); });
-            req.on('error', function(){resolve(null);}); setTimeout(function(){req.destroy();resolve(null);},10000); req.end();
-          });
-          if (sbResult && sbResult.response && sbResult.response.length > 0) {
-            videoUrl = sbResult.response[0].videos && sbResult.response[0].videos[0] && sbResult.response[0].videos[0].embed;
-          }
-        } catch(e) {}
-      }
-
-      if (videoUrl) {
-        // Send to all subscribers
-        var subs = await getSubscribers();
-        for (var s = 0; s < subs.length; s++) {
-          await sendChatwootMessage(subs[s].conversation_id, 'Watch the goal: ' + videoUrl);
-          await new Promise(function(r) { setTimeout(r, 300); });
-        }
-        await queryDB("UPDATE wp_video_jobs SET status='sent', video_url=$1 WHERE id=$2", [videoUrl, job.id]);
-        console.log('Video found and sent for event:', job.event_key);
-      } else {
-        var delays = [5*60, 10*60, 20*60, 0];
-        var nextDelaySecs = delays[job.attempt] || 0;
-        if (job.attempt >= 3) {
-          await queryDB("UPDATE wp_video_jobs SET status='unavailable', attempt=$1 WHERE id=$2", [job.attempt + 1, job.id]);
-        } else {
-          var nextRetry = new Date(Date.now() + nextDelaySecs * 1000);
-          await queryDB("UPDATE wp_video_jobs SET attempt=$1, next_retry=$2 WHERE id=$3", [job.attempt + 1, nextRetry, job.id]);
-        }
-      }
-    }
-  } catch(e) { console.log('Video job error:', e.message); }
-}
-
-// ============= DETERMINE SITUATION =============
-function getSituation(eventType, homeScore, awayScore, scoringTeam, home, away, minute) {
-  if (eventType !== 'Goal') return 'Red card! Match dynamics changed.';
-  var isHome = scoringTeam === home;
-  var scorerScore = isHome ? homeScore : awayScore;
-  var opponentScore = isHome ? awayScore : homeScore;
-  var min = parseInt(minute) || 0;
-  if (scorerScore === opponentScore) return 'Equaliser — level again!';
-  if (scorerScore === 1 && opponentScore === 0 && min <= 20) return 'Early opener!';
-  if (scorerScore - opponentScore === 2) return 'Two goals ahead now — pulling away!';
-  if (min >= 85) return 'Late drama! So late in the game!';
-  if (min >= 75) return 'Late goal! Changes everything this late.';
-  if (scorerScore - opponentScore === 1 && opponentScore > 0) return 'Now in front after being level!';
-  return 'They take the lead!';
-}
-
-// ============= PROCESS ONE EVENT (in sequential queue) =============
-async function processEvent(event, matchInfo, fixtureId, eventId) {
-  var t0 = Date.now();
-  var minuteNum = parseInt(event.time) || 0;
-
-  // FIX #1: Reconstruct score from processed events — do NOT increment API score
-  var scoreBeforeThisEvent = await getScoreAfterEvent(fixtureId, matchInfo.home, matchInfo.away, minuteNum - 1);
-  var homeScore = scoreBeforeThisEvent.homeScore;
-  var awayScore = scoreBeforeThisEvent.awayScore;
-  if (event.type === 'Goal') {
-    if (event.team === matchInfo.home) homeScore++;
-    else awayScore++;
+// ========= WHATSAPP COMMANDS =========
+async function handleWatch(conversationId, text) {
+  const team = await resolveTeam(text);
+  if (!team) {
+    return sendChatwoot(conversationId, `I couldn't identify "${text}".\n\nTry:\nWATCH ARSENAL\nWATCH CHELSEA\nWATCH LIVERPOOL`);
   }
+  await follow(conversationId, team);
+  await sendChatwoot(conversationId, `🔴 ${team.name} selected!\n\nI'll watch their matches for you.`);
+  await showUpcoming(conversationId);
+}
 
-  var flag = matchInfo.country === 'England' ? '' : matchInfo.country === 'Brazil' ? '' : matchInfo.country === 'Kenya' ? '' : '';
-  var situation = getSituation(event.type, homeScore, awayScore, event.team, matchInfo.home, matchInfo.away, minuteNum);
-
-  var eventContext = {
-    competition: (matchInfo.league || 'Football') + ' ' + flag,
-    home: matchInfo.home, away: matchInfo.away,
-    homeScore: homeScore, awayScore: awayScore,
-    scorer: event.player || 'Player',
-    minute: event.time || '?',
-    eventType: event.type === 'Goal' ? 'GOAL' : 'RED CARD',
-    situation: situation
-  };
-
-  // Get subscribers
-  var allSubs = await getSubscribers();
-  var relevantSubs = allSubs.filter(function(s) {
-    var teams = (s.teams || 'all').toLowerCase().trim();
-    if (teams === 'all' || teams === 'all matches') return true;
-    return teams.split(',').some(function(t) {
-      return matchInfo.home.toLowerCase().includes(t.trim()) || matchInfo.away.toLowerCase().includes(t.trim());
-    });
-  });
-  if (relevantSubs.length === 0) { await markEventFailed(eventId); return; }
-
-  // Group by language
-  var byLang = {};
-  relevantSubs.forEach(function(s) {
-    var lang = 'english';
-    if (!byLang[lang]) byLang[lang] = [];
-    byLang[lang].push(s.conversation_id);
-  });
-
-  // FIX #6: Get actual commentary text history
-  var recentCommentary = await getRecentCommentary(fixtureId);
-
-  var emoji = event.type === 'Goal' ? '' : '';
-  var allCommentary = '';
-
-  for (var lang in byLang) {
-    var convIds = byLang[lang];
-    var commentary = await generateCommentary(eventContext, lang, recentCommentary);
-    if (!commentary) commentary = eventContext.eventType + '! ' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away;
-    if (!allCommentary) allCommentary = commentary;
-
-    var textMsg = flag + ' ' + (matchInfo.league || 'Football') + '\n';
-    textMsg += emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n';
-    textMsg += matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n';
-    if (event.player) textMsg += event.player + '\n';
-    textMsg += '\n' + textVersion;
-
-    // STEP 1: Send text alert immediately
-    var textMsg2 = flag + ' ' + (matchInfo.league || 'Football') + '\n' + emoji + ' ' + event.time + "' " + eventContext.eventType + '!\n' + matchInfo.home + ' ' + homeScore + '-' + awayScore + ' ' + matchInfo.away + '\n' + (event.player ? event.player + '\n' : '') + '\n' + textVersion;
-    var atLeastOneSent = false;
-    for (var i = 0; i < convIds.length; i++) {
-      var sent = await sendChatwootMessage(convIds[i], textMsg2);
-      if (sent) atLeastOneSent = true;
-      await new Promise(function(r) { setTimeout(r, 300); });
-    }
-    if (!atLeastOneSent) { console.log('All Chatwoot deliveries failed for lang:', lang); continue; }
-    console.log('Text sent in', Date.now()-t0, 'ms for', convIds.length, lang, 'subscribers');
-
-    // STEP 2: Voice after text — use VOICE script not text script
-    var audioBuffer = await textToVoiceElevenLabs(voiceVersion);
-    if (!audioBuffer) audioBuffer = await textToVoiceAzure(voiceVersion);
-    if (audioBuffer) {
-      for (var i = 0; i < convIds.length; i++) {
-        await sendVoiceChatwoot(convIds[i], audioBuffer);
-        await new Promise(function(r) { setTimeout(r, 300); });
-      }
-      console.log('Voice sent in', Date.now()-t0, 'ms');
-    }
+async function webhook(payload) {
+  if (payload.event !== "message_created" || payload.message_type !== "incoming" || payload.sender?.type === "agent_bot") return;
+  const conversationId = String(payload.conversation?.id || "");
+  const text = String(payload.content || "").trim();
+  if (!conversationId || !text) return;
+  await db(`UPDATE wp_subscribers SET last_message_at=NOW(), last_active_at=NOW() WHERE conversation_id=$1`, [conversationId]).catch(() => {});
+  const watch = text.match(/^watch(?:party)?\s+(.+)$/i);
+  if (watch) return handleWatch(conversationId, watch[1].trim());
+  const n = norm(text);
+  if (n === "matches" || n === "my matches" || n === "fixtures") return showUpcoming(conversationId);
+  if (n === "stop" || n === "stop watchparty" || n === "stop watch") {
+    await stop(conversationId);
+    return sendChatwoot(conversationId, "WatchParty alerts stopped. Text WATCH ARSENAL to start again.");
   }
-
-  // FIX #2: Mark sent AFTER successful delivery
-  await markEventSent(eventId, allCommentary, homeScore, awayScore);
-  console.log('Event complete in', Date.now()-t0, 'ms');
-
-  // STEP 3: FIX #4+#5 — ONE video job per event (outside language loop)
-  if (event.type === 'Goal') {
-    var eventKey = fixtureId + '-' + event.time + '-' + (event.team || '') + '-' + (event.player || '');
-    await createVideoJob(eventKey, fixtureId, matchInfo.home, matchInfo.away, minuteNum);
+  if (n === "status") {
+    const s = await db(`SELECT active FROM wp_subscribers WHERE conversation_id=$1`, [conversationId]);
+    const teams = await myTeams(conversationId);
+    return sendChatwoot(conversationId, s.rows[0]?.active ?
+      `⚽ WatchParty active\nFollowing: ${teams.map(t => t.team_name).join(", ") || "none"}\nLive monitored: ${liveMatches.size}` :
+      "WatchParty is not active.\n\nTry: WATCH ARSENAL");
+  }
+  if (n === "help" || n === "watchparty") {
+    return sendChatwoot(conversationId, "⚽ WATCHPARTY\n\nWATCH ARSENAL — follow a team\nMATCHES — upcoming fixtures\nSTATUS — your status\nSTOP — stop alerts");
   }
 }
 
-// ============= QUEUE EVENT PER MATCH =============
-function queueEvent(event, matchInfo, fixtureId, eventId) {
-  if (!matchQueues[fixtureId]) matchQueues[fixtureId] = Promise.resolve();
-  matchQueues[fixtureId] = matchQueues[fixtureId].then(function() {
-    return processEvent(event, matchInfo, fixtureId, eventId);
-  }).catch(function(e) { console.log('Queue error for', fixtureId, ':', e.message); });
-}
-
-// ============= POLL LIVE MATCHES =============
-var liveMatches = {};
-
-async function pollLiveMatches() {
-  if (isPolling) { console.log('Poll already running — skipping'); return; }
-  isPolling = true;
-  try {
-    var currentLiveIds = {};
-
-    // GOAL API first — 1000 requests/day free
-    if (GOAL_API_KEY) {
-      var goalResult = await goalAPI('/fixtures/live');
-      if (goalResult && goalResult.data && Array.isArray(goalResult.data)) {
-        // Big leagues only — no women's, no lower divisions
-        var bigLeagues = [
-          'premier league',
-          'fa cup',
-          'carabao cup',
-          'champions league',
-          'europa league',
-          'conference league',
-          'nations league',
-          'international friendlies'
-        ];
-        // Only Nations League A and B — not C and D
-        var excludeLeagues = ['league c', 'league d', 'league c -', 'league d -'];
-        var womenKeywords = ['women', 'woman', 'frauen', 'feminine', 'femenina', 'feminin', ' w ', ' w.', 'wsl', 'nwsl', 'female'];
-        var filtered = goalResult.data.filter(function(m) {
-          var league = ((m.league && m.league.name) || '').toLowerCase();
-          var home = ((m.homeTeam && m.homeTeam.name) || '').toLowerCase();
-          var away = ((m.awayTeam && m.awayTeam.name) || '').toLowerCase();
-          // Exclude women's leagues
-          var isWomen = womenKeywords.some(function(w) { return league.includes(w) || home.endsWith(' w') || away.endsWith(' w'); });
-          if (isWomen) return false;
-          // Exclude Nations League C and D
-          var isLowNations = excludeLeagues.some(function(ex) { return league.includes(ex); });
-          if (isLowNations) return false;
-          // Include only big leagues
-          return bigLeagues.some(function(bl) { return league.includes(bl); });
-        });
-        var matchesToPoll = filtered.length > 0 ? filtered : [];
-        console.log('Filtered to', matchesToPoll.length, 'big league matches from', goalResult.data.length, 'total');
-
-        matchesToPoll.forEach(function(m) {
-          var fId = String(m.id);
-          currentLiveIds[fId] = true;
-          if (!liveMatches[fId]) {
-            liveMatches[fId] = {
-              home: (m.homeTeam && m.homeTeam.name) || 'Home',
-              away: (m.awayTeam && m.awayTeam.name) || 'Away',
-              league: (m.league && m.league.name) || 'Football',
-              country: (m.league && m.league.country) || '',
-              source: 'goal-api'
-            };
-            queryDB('INSERT INTO wp_matches (fixture_id, league_name, country, home_team, away_team, status, home_score, away_score) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (fixture_id) DO UPDATE SET status=$6, home_score=$7, away_score=$8, last_checked=NOW()',
-              [fId, liveMatches[fId].league, liveMatches[fId].country, liveMatches[fId].home, liveMatches[fId].away, 'live',
-               (m.score && m.score.home) || 0, (m.score && m.score.away) || 0]).catch(function(){});
-          }
-        });
-        console.log('GOAL API live matches:', Object.keys(currentLiveIds).length);
-      }
-    }
-
-    // API-Football fallback — only if GOAL API returns nothing
-    if (Object.keys(currentLiveIds).length === 0 && FOOTBALL_API_KEY) {
-      var afResult = await footballAPI('/fixtures?live=all');
-      if (afResult && afResult.response) {
-        afResult.response.forEach(function(m) {
-          var fId = String(m.fixture.id);
-          currentLiveIds[fId] = true;
-          if (!liveMatches[fId]) {
-            liveMatches[fId] = {
-              home: m.teams.home.name, away: m.teams.away.name,
-              league: m.league.name, country: m.league.country,
-              source: 'api-football'
-            };
-            queryDB('INSERT INTO wp_matches (fixture_id, league_name, country, home_team, away_team, status, home_score, away_score) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (fixture_id) DO UPDATE SET status=$6, home_score=$7, away_score=$8, last_checked=NOW()',
-              [fId, m.league.name, m.league.country, m.teams.home.name, m.teams.away.name, 'live', m.goals.home || 0, m.goals.away || 0]).catch(function(){});
-          }
-        });
-        console.log('API-Football fallback live matches:', Object.keys(currentLiveIds).length);
-      }
-    }
-
-    // Clean finished matches
-    Object.keys(liveMatches).forEach(function(fId) {
-      if (!currentLiveIds[fId]) { delete liveMatches[fId]; delete matchQueues[fId]; }
-    });
-
-    console.log('Live matches:', Object.keys(liveMatches).length);
-
-    // Poll events for each live match
-    for (var fixtureId in liveMatches) {
-      await pollMatchEvents(fixtureId);
-      await new Promise(function(r) { setTimeout(r, 500); });
-    }
-  } catch(e) { console.log('Poll live error:', e.message); }
-  finally { isPolling = false; }
-}
-
-async function pollMatchEvents(fixtureId) {
-  try {
-    var matchInfo = liveMatches[fixtureId];
-    if (!matchInfo) return;
-
-    var rawEvents = [];
-    var source = matchInfo.source || 'goal-api';
-
-    // Try GOAL API events first
-    if (GOAL_API_KEY && source !== 'api-football') {
-      var goalFixture = await goalAPI('/fixtures/' + fixtureId);
-      if (goalFixture && goalFixture.data) {
-        var fd = goalFixture.data;
-        // Check if match finished
-        if (fd.matchStatus === 'FINISHED' || fd.matchStatus === 'FT' || fd.matchStatus === 'ENDED') {
-          console.log('Match', fixtureId, 'finished (GOAL API) — stopping');
-          delete liveMatches[fixtureId]; delete matchQueues[fixtureId];
-          return;
-        }
-        // Parse events — GOAL API format
-        var goalApiEvents = fd.events || [];
-        rawEvents = goalApiEvents.map(function(e) {
-          // Determine scorer and team
-          var player = e.homeScorer || e.awayScorer || '';
-          var isHome = !!e.homeScorer;
-          var matchInfoLocal = liveMatches[fixtureId] || {};
-          var team = isHome ? matchInfoLocal.home : matchInfoLocal.away;
-          // Parse score from "1 - 1" format
-          var scoreParts = (e.score || '0 - 0').split(' - ');
-          var homeScore = parseInt(scoreParts[0]) || 0;
-          var awayScore = parseInt(scoreParts[1]) || 0;
-          return {
-            type: e.type === 'GOAL' ? 'Goal' : (e.type === 'RED_CARD' ? 'Card' : e.type),
-            detail: e.type,
-            player: player.replace(' (o.g.)', ''),
-            ownGoal: player.includes('(o.g.)'),
-            team: team,
-            elapsed: parseInt(e.time) || 0,
-            extra: 0,
-            score: e.score,
-            homeScore: homeScore,
-            awayScore: awayScore
-          };
-        }).filter(function(e) { return e.type === 'Goal' || e.type === 'Card'; });
-        console.log('GOAL API events found:', rawEvents.length, 'for', fixtureId);
-      }
-    }
-
-    // Fallback to API-Football
-    if (rawEvents.length === 0 && FOOTBALL_API_KEY) {
-      var eventsResult = await footballAPI('/fixtures/events?fixture=' + fixtureId);
-      if (eventsResult && eventsResult.response) {
-        rawEvents = eventsResult.response.map(function(e) {
-          return {
-            type: e.type === 'Goal' ? 'Goal' : (e.detail === 'Red Card' ? 'Card' : e.type),
-            detail: e.detail,
-            player: e.player && e.player.name,
-            team: e.team && e.team.name,
-            elapsed: e.time && e.time.elapsed || 0,
-            extra: e.time && e.time.extra || 0
-          };
-        });
-      }
-    }
-
-    // Sort chronologically
-    var events = rawEvents
-      .filter(function(e) { return e.type === 'Goal' || (e.type === 'Card' && (e.detail === 'Red Card' || e.detail === 'red_card')); })
-      .sort(function(a, b) {
-        return (a.elapsed + a.extra * 0.1) - (b.elapsed + b.extra * 0.1);
-      });
-
-    for (var i = 0; i < events.length; i++) {
-      var e = events[i];
-      var eventKey = fixtureId + '-' + e.elapsed + '-' + e.extra + '-' + (e.team || '') + '-' + (e.player || '') + '-' + e.type;
-
-      var eventId = await tryInsertEvent(eventKey, fixtureId, e.elapsed, e.type, e.player, e.team);
-      if (!eventId) continue;
-
-      var event = {
-        type: e.type,
-        detail: e.detail,
-        player: e.player,
-        team: e.team,
-        time: e.elapsed + (e.extra > 0 ? '+' + e.extra : '')
-      };
-
-      console.log('NEW EVENT queued:', JSON.stringify(event), 'Match:', matchInfo.home, 'vs', matchInfo.away);
-      queueEvent(event, matchInfo, fixtureId, eventId);
-    }
-  } catch(e) { console.log('Poll events error:', e.message); }
-}
-
-// ============= HANDLE WHATSAPP =============
-async function handleIncomingWhatsApp(payload) {
-  try {
-    if (payload.event !== 'message_created' || payload.message_type !== 'incoming') return;
-    var message = String(payload.content || '').trim().toLowerCase();
-    var conversationId = String(payload.conversation && payload.conversation.id || '');
-    var senderName = (payload.sender && payload.sender.name) || 'Fan';
-    if (!message || !conversationId) return;
-    console.log('WatchParty from', senderName, ':', message);
-
-    // Only handle WatchParty commands — ignore AfriDesk responses
-    if (payload.sender && payload.sender.type === 'agent_bot') return;
-
-    if (message.startsWith('subscribe') || message.startsWith('watchparty')) {
-      var parts = message.replace('watchparty', '').replace('subscribe', '').trim().split(' ');
-      var team = parts[0] || 'all';
-      var lang = (parts[1] || 'sheng').toLowerCase();
-      lang = 'english'; // English only
-      await saveSubscriber(conversationId, lang, team);
-      var teamDisplay = (team === 'all') ? 'ALL matches' : team;
-      var msg = lang === 'english'
-        ? 'WatchParty activated! Subscribed to ' + teamDisplay + ' in ENGLISH. Text STOP WATCHPARTY to unsubscribe.'
-        : 'WatchParty imewashwa! Umejiunga na ' + teamDisplay + ' kwa lugha ya ' + lang.toUpperCase() + '. Text STOP WATCHPARTY kusimama.';
-      await sendChatwootMessage(conversationId, msg);
-      return;
-    }
-
-    if (message.includes('stop watchparty') || message === 'stop') {
-      await removeSubscriber(conversationId);
-      await sendChatwootMessage(conversationId, 'WatchParty alerts zimesimamishwa. Text SUBSCRIBE kuanza tena!');
-      return;
-    }
-
-    if (message === 'status' || message === 'hali') {
-      var subs = await getSubscribers();
-      var mine = subs.find(function(s) { return s.conversation_id === conversationId; });
-      var count = await getAPICount();
-      if (!mine) { await sendChatwootMessage(conversationId, 'Bado hujajiunga! Text: SUBSCRIBE ARSENAL SHENG'); }
-      else { await sendChatwootMessage(conversationId, 'Umejiunga! Timu: ' + mine.teams + ' | Lugha: ' + mine.language + ' | Live sasa: ' + Object.keys(liveMatches).length + ' | API: ' + count + '/90'); }
-      return;
-    }
-  } catch(e) { console.log('Handler error:', e.message); }
-}
-
-// ============= V1 MIGRATION =============
-async function runMigration() {
-  console.log('Starting WatchParty V1 migration...');
-  var statements = [
-    "ALTER TABLE wp_subscribers ADD COLUMN IF NOT EXISTS watchparty_iq INT DEFAULT 0",
-    "ALTER TABLE wp_subscribers ADD COLUMN IF NOT EXISTS iq_level VARCHAR(50) DEFAULT 'BEGINNER'",
-    "ALTER TABLE wp_subscribers ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP DEFAULT NOW()",
-    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS home_team_id VARCHAR(20)",
-    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS away_team_id VARCHAR(20)",
-    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS kickoff_utc TIMESTAMP",
-    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS is_derby BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE wp_matches ADD COLUMN IF NOT EXISTS derby_name VARCHAR(100)",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS extra_minute INT DEFAULT 0",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS player_id VARCHAR(20)",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS team_id VARCHAR(20)",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS assist VARCHAR(100)",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS score_home_before INT DEFAULT 0",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS score_away_before INT DEFAULT 0",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS score_home_after INT DEFAULT 0",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS score_away_after INT DEFAULT 0",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS voice_version TEXT",
-    "ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS emotion_level NUMERIC(3,2) DEFAULT 0.4",
-    `CREATE TABLE IF NOT EXISTS wp_subscriber_teams (id SERIAL PRIMARY KEY, subscriber_id VARCHAR NOT NULL, team_name VARCHAR(100) NOT NULL, team_id VARCHAR(20), following_since TIMESTAMP DEFAULT NOW(), CONSTRAINT uq_subscriber_team UNIQUE (subscriber_id, team_name))`,
-    `CREATE TABLE IF NOT EXISTS wp_subscriber_preferences (subscriber_id VARCHAR PRIMARY KEY, goals BOOLEAN DEFAULT TRUE, red_cards BOOLEAN DEFAULT TRUE, predictions BOOLEAN DEFAULT TRUE, voice BOOLEAN DEFAULT TRUE, halftime BOOLEAN DEFAULT TRUE, fulltime BOOLEAN DEFAULT TRUE, important_only BOOLEAN DEFAULT FALSE, updated_at TIMESTAMP DEFAULT NOW())`,
-    `CREATE TABLE IF NOT EXISTS wp_match_narrative (fixture_id VARCHAR PRIMARY KEY, opening_goal_team VARCHAR(100), lead_changes INT DEFAULT 0, equalizer_count INT DEFAULT 0, comeback BOOLEAN DEFAULT FALSE, late_goals INT DEFAULT 0, is_thriller BOOLEAN DEFAULT FALSE, biggest_lead INT DEFAULT 0, current_momentum VARCHAR(50), story_so_far TEXT, updated_at TIMESTAMP DEFAULT NOW())`,
-    `CREATE TABLE IF NOT EXISTS wp_match_context (fixture_id VARCHAR PRIMARY KEY, situation VARCHAR(50) DEFAULT 'NORMAL', emotion_level NUMERIC(3,2) DEFAULT 0.4, is_derby BOOLEAN DEFAULT FALSE, derby_name VARCHAR(100), h2h_home_wins INT DEFAULT 0, h2h_away_wins INT DEFAULT 0, h2h_draws INT DEFAULT 0, last_event_type VARCHAR(50), last_event_minute INT, updated_at TIMESTAMP DEFAULT NOW())`,
-    `CREATE TABLE IF NOT EXISTS wp_derby_database (id SERIAL PRIMARY KEY, team1 VARCHAR(100) NOT NULL, team2 VARCHAR(100) NOT NULL, derby_name VARCHAR(100) NOT NULL, rivalry_level INT DEFAULT 3, CONSTRAINT uq_derby_pair UNIQUE (team1, team2))`,
-    `CREATE TABLE IF NOT EXISTS wp_teams (team_id VARCHAR(20) PRIMARY KEY, name VARCHAR(100) NOT NULL, short_name VARCHAR(10), league VARCHAR(100), country VARCHAR(50), updated_at TIMESTAMP DEFAULT NOW())`,
-    `CREATE TABLE IF NOT EXISTS wp_players (player_id VARCHAR(20) PRIMARY KEY, name VARCHAR(100) NOT NULL, nationality VARCHAR(50), current_team_id VARCHAR(20), current_team_name VARCHAR(100), position VARCHAR(20), updated_at TIMESTAMP DEFAULT NOW())`,
-    `CREATE TABLE IF NOT EXISTS wp_player_seasons (id SERIAL PRIMARY KEY, player_id VARCHAR(20) NOT NULL, team_id VARCHAR(20), season VARCHAR(10) NOT NULL, appearances INT DEFAULT 0, goals INT DEFAULT 0, assists INT DEFAULT 0, yellow_cards INT DEFAULT 0, red_cards INT DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW(), CONSTRAINT uq_player_season UNIQUE (player_id, team_id, season))`,
-    `CREATE TABLE IF NOT EXISTS wp_player_transfers (id SERIAL PRIMARY KEY, player_id VARCHAR(20) NOT NULL, from_team VARCHAR(100), from_team_id VARCHAR(20), to_team VARCHAR(100), to_team_id VARCHAR(20), transfer_date DATE, transfer_type VARCHAR(20))`,
-    `CREATE TABLE IF NOT EXISTS wp_predictions (id SERIAL PRIMARY KEY, subscriber_id VARCHAR NOT NULL, fixture_id VARCHAR NOT NULL, prediction_type VARCHAR(30) NOT NULL, prediction_value VARCHAR(100) NOT NULL, correct BOOLEAN, iq_earned INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), CONSTRAINT uq_prediction UNIQUE (subscriber_id, fixture_id, prediction_type))`,
-    `CREATE TABLE IF NOT EXISTS wp_watchparty_iq (id SERIAL PRIMARY KEY, subscriber_id VARCHAR NOT NULL, fixture_id VARCHAR NOT NULL, predictions_correct INT DEFAULT 0, predictions_total INT DEFAULT 0, reactions_sent INT DEFAULT 0, iq_earned_this_match INT DEFAULT 0, total_iq INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), CONSTRAINT uq_iq_match UNIQUE (subscriber_id, fixture_id))`,
-    `CREATE TABLE IF NOT EXISTS wp_delivery_log (id SERIAL PRIMARY KEY, subscriber_id VARCHAR NOT NULL, fixture_id VARCHAR, event_key VARCHAR(200), text_sent BOOLEAN DEFAULT FALSE, text_delivered BOOLEAN DEFAULT FALSE, voice_sent BOOLEAN DEFAULT FALSE, voice_delivered BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`,
-    `INSERT INTO wp_derby_database (team1,team2,derby_name,rivalry_level) VALUES ('Arsenal','Tottenham','North London Derby',5),('Tottenham','Arsenal','North London Derby',5),('Liverpool','Everton','Merseyside Derby',5),('Everton','Liverpool','Merseyside Derby',5),('Manchester City','Manchester United','Manchester Derby',5),('Manchester United','Manchester City','Manchester Derby',5),('Chelsea','Arsenal','London Derby',4),('Arsenal','Chelsea','London Derby',4),('Chelsea','Tottenham','London Derby',4),('Tottenham','Chelsea','London Derby',4),('Manchester United','Liverpool','Northwest Derby',5),('Liverpool','Manchester United','Northwest Derby',5),('Real Madrid','Barcelona','El Clasico',5),('Barcelona','Real Madrid','El Clasico',5),('Celtic','Rangers','Old Firm Derby',5),('Rangers','Celtic','Old Firm Derby',5) ON CONFLICT DO NOTHING`,
-    "CREATE INDEX IF NOT EXISTS idx_processed_events_fixture ON wp_processed_events(fixture_id)",
-    "CREATE INDEX IF NOT EXISTS idx_processed_events_status ON wp_processed_events(status)",
-    "CREATE INDEX IF NOT EXISTS idx_matches_status ON wp_matches(status)",
-    "CREATE INDEX IF NOT EXISTS idx_subscriber_teams_sub ON wp_subscriber_teams(subscriber_id)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_subscriber ON wp_predictions(subscriber_id)",
-    "CREATE INDEX IF NOT EXISTS idx_iq_subscriber ON wp_watchparty_iq(subscriber_id)"
-  ];
-  var success = 0; var failed = 0;
-  for (var i = 0; i < statements.length; i++) {
-    try {
-      await queryDB(statements[i]);
-      success++;
-      console.log('OK (' + (i+1) + '/' + statements.length + ')');
-    } catch(e) {
-      failed++;
-      console.log('SKIP (' + (i+1) + '): ' + e.message.substring(0,80));
-    }
+// ========= HTTP SERVER =========
+const server = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, liveMatches: liveMatches.size, polling, time: new Date().toISOString() }));
   }
-  console.log('Migration done! Success:', success, 'Skipped:', failed);
-}
-
-// ============= HTTP SERVER =============
-var server = http.createServer(function(req, res) {
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200);
-    res.end('WatchParty Running!\nLive: ' + Object.keys(liveMatches).length + ' matches');
-    return;
-  }
-  if (req.method === 'GET' && req.url === '/poll-now') { res.writeHead(200); res.end('Polling!'); pollLiveMatches(); return; }
-  if (req.method === 'GET' && req.url === '/reset-api-counter') { res.writeHead(200); res.end('Reset!'); resetAPICount(); return; }
-
-  if (req.method === 'GET' && req.url === '/run-migration') {
-    res.writeHead(200); res.end('Migration started! Check logs...');
-    runMigration();
-    return;
-  }
-  if (req.method === 'POST' && req.url === '/webhook') {
-    var body = '';
-    req.on('data', function(c) { body += c; });
-    req.on('end', async function() {
-      res.writeHead(200); res.end('OK');
-      try { await handleIncomingWhatsApp(JSON.parse(body)); } catch(e) {}
+  if (req.method === "GET" && req.url === "/poll-now") { res.writeHead(200); res.end("Polling started"); poll(); return; }
+  if (req.method === "POST" && req.url === "/webhook") {
+    let body = "";
+    req.on("data", c => body += c);
+    req.on("end", async () => {
+      res.writeHead(200); res.end("OK");
+      try { await webhook(JSON.parse(body)); } catch (e) { console.log("Webhook error:", e.message); }
     });
     return;
   }
-  res.writeHead(200); res.end('WatchParty AI');
+  res.writeHead(200); res.end("WatchParty V1");
 });
 
-server.listen(PORT, async function() {
-  console.log('WatchParty starting on port ' + PORT);
-  await setupDB();
-  var dictId = await setupElevenLabsAlias();
-  // FIX 1: Recover pending events from before crash
-  setTimeout(async function() {
-    try {
-      var pending = await queryDB("SELECT pe.* FROM wp_processed_events pe WHERE pe.status='pending' AND pe.processed_at > NOW() - INTERVAL '20 minutes' LIMIT 5");
-      if (pending.rows.length > 0) {
-        console.log('Recovering', pending.rows.length, 'pending events from crash...');
-        for (var i = 0; i < pending.rows.length; i++) {
-          var ev = pending.rows[i];
-          // Get match info from DB
-          var matchRow = await queryDB('SELECT * FROM wp_matches WHERE fixture_id=$1', [ev.fixture_id]).catch(function(){return {rows:[]};});
-          if (matchRow.rows.length === 0) { await queryDB("UPDATE wp_processed_events SET status='failed' WHERE id=$1", [ev.id]); continue; }
-          var m = matchRow.rows[0];
-          var matchInfo = { home: m.home_team, away: m.away_team, league: m.league_name, country: m.country };
-          var event = { type: ev.event_type, player: ev.player, team: ev.team, time: String(ev.minute) };
-          console.log('Retrying event:', ev.event_key);
-          queueEvent(event, matchInfo, String(ev.fixture_id), ev.id);
-        }
-      }
-    } catch(e) { console.log('Pending recovery error:', e.message); }
-  }, 5000);
-  console.log('Voice:', ELEVENLABS_KEY ? 'ElevenLabs' : AZURE_KEY ? 'Azure' : 'None');
-  console.log('Football API:', FOOTBALL_API_KEY ? 'Ready' : 'Missing');
-
-  // Poll every 3 minutes — conserve API budget
-  setInterval(pollLiveMatches, 3 * 60 * 1000);
-  // Process video jobs every 5 minutes
-  setInterval(processVideJobs, 5 * 60 * 1000);
-  await pollLiveMatches();
-
-  console.log('WatchParty Ready!');
+// ========= STARTUP =========
+server.listen(PORT, async () => {
+  console.log("WatchParty V1 starting on port", PORT);
+  try {
+    await schemaCheck();
+    await closeOldPending();
+    console.log("GOAL API:", GOAL_API_KEY ? "Ready" : "Missing");
+    console.log("API-Football fallback:", FOOTBALL_API_KEY ? "Ready" : "Missing");
+    console.log("Chatwoot:", CHATWOOT_TOKEN ? "Ready" : "Missing");
+    await poll();
+    setInterval(poll, POLL_MS);
+    console.log("WatchParty V1 Ready!");
+  } catch (e) {
+    console.error("STARTUP FAILED:", e.message);
+    process.exit(1);
+  }
 });
