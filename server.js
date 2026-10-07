@@ -348,12 +348,20 @@ async function showUpcoming(conversationId) {
 // ========= LIVE DISCOVERY =========
 async function liveFixturesForTeam(team) {
   if (!team.team_id) return [];
-  const r = await goal(`/teams/${encodeURIComponent(team.team_id)}/fixtures`);
+  // Use today's date to find matches — then check live status
+  const today = new Date().toISOString().split('T')[0];
+  const r = await goal(`/fixtures?from=${today}&to=${today}&leagueId=${PREMIER_LEAGUE_ID}&limit=100`);
   if (!r?.data || !Array.isArray(r.data)) return [];
-  return r.data.map(goalMatch).filter(Boolean).filter(m => allowedCompetition(m.league)).filter(m => {
-    const s = norm(m.status);
-    return s.includes("live") || s.includes("half") || s.includes("1h") || s.includes("2h") || s === "ht" || s === "et";
-  });
+  return r.data
+    .map(goalMatch)
+    .filter(Boolean)
+    .filter(m => allowedCompetition(m.league))
+    .filter(m => String(m.homeId) === String(team.team_id) || String(m.awayId) === String(team.team_id))
+    .filter(m => {
+      const s = norm(m.status);
+      return s.includes("live") || s.includes("half") || s.includes("1h") ||
+             s.includes("2h") || s === "ht" || s === "et" || s.includes("progress");
+    });
 }
 
 async function discoverLive() {
