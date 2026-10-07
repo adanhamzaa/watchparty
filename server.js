@@ -13,6 +13,7 @@ const CHATWOOT_URL = process.env.CHATWOOT_URL || "chatwoot-production-5bb4.up.ra
 const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || "1";
 const POLL_MS = 3 * 60 * 1000;
+const UPCOMING_DAYS = 14;
 
 const ALLOWED = [
   "premier league","fa cup","carabao cup","efl cup","league cup",
@@ -301,10 +302,20 @@ async function resolveTeam(text) {
 async function upcomingForTeam(team) {
   if (!team.team_id) return [];
   const r = await goal(`/teams/${encodeURIComponent(team.team_id)}/upcoming`);
-  if (r?.data && Array.isArray(r.data)) {
-    return r.data.map(goalMatch).filter(Boolean).filter(m => allowedCompetition(m.league)).slice(0,5);
-  }
-  return [];
+  if (!r?.data || !Array.isArray(r.data)) return [];
+  const now = new Date();
+  const fourteenDays = new Date(now.getTime() + UPCOMING_DAYS * 24 * 60 * 60 * 1000);
+  return r.data
+    .map(goalMatch)
+    .filter(Boolean)
+    .filter(m => allowedCompetition(m.league))
+    .filter(m => {
+      if (!m.kickoffUtc) return false;
+      const kickoff = new Date(m.kickoffUtc);
+      return !Number.isNaN(kickoff.getTime()) && kickoff >= now && kickoff <= fourteenDays;
+    })
+    .sort((a, b) => new Date(a.kickoffUtc) - new Date(b.kickoffUtc))
+    .slice(0, 5);
 }
 
 async function showUpcoming(conversationId) {
