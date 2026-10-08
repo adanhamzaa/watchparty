@@ -145,7 +145,17 @@ function goalEvent(x, match) {
   if (type === "goal" || type === "score") eventType = "Goal";
   if (type === "red card" || type === "red_card") eventType = "Card";
   if (!eventType) return null;
-  const home = !!x.homeScorer;
+
+  // Prefer explicit teamId from the event (reliable for cards and own goals).
+  // Fall back to homeScorer presence only for goals where the API uses that field.
+  const explicitTeamId = String(x.teamId || x.team?.id || "");
+  let home;
+  if (explicitTeamId && match.homeId) {
+    home = String(match.homeId) === explicitTeamId;
+  } else {
+    home = !!x.homeScorer; // goals: homeScorer is set for home-team scorer
+  }
+
   const score = String(x.score || "0 - 0").split("-").map(v => Number(v.trim()));
   return {
     type: eventType,
@@ -213,6 +223,24 @@ async function schemaCheck() {
   const missing = names.filter(x => !found.has(x));
   if (missing.length) throw new Error("Missing tables: " + missing.join(", "));
   console.log("V1 database: 15/15 tables OK");
+
+  // Verify all columns processEvent() writes to exist in wp_processed_events
+  const colR = await db(`SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='wp_processed_events'`);
+  const cols = new Set(colR.rows.map(c => c.column_name));
+  const required = [
+    "id","event_key","fixture_id","minute","extra_minute","event_type",
+    "player","player_id","team","team_id","assist","status","processed_at",
+    "commentary_text","voice_script","situation",
+    "home_score","away_score","score_home_before","score_away_before",
+    "score_home_after","score_away_after","emotion_level"
+  ];
+  const missingCols = required.filter(c => !cols.has(c));
+  if (missingCols.length) {
+    // Non-fatal: addVolume2Columns will add voice_script/situation; others need a migration
+    console.warn("wp_processed_events missing columns (check migrations):", missingCols.join(", "));
+  } else {
+    console.log("wp_processed_events: all required columns present");
+  }
 }
 
 // ========= SUBSCRIBERS =========
@@ -475,8 +503,9 @@ async function insertNewEvent(match, e) {
 // ========= V3A: MATCH BRAIN =========
 
 async function getRecentMatchEvents(fixtureId, limit) {
-  var r = await db("SELECT minute, extra_minute, event_type, player, team, home_score, away_score FROM wp_processed_events WHERE fixture_id=$1 AND status IN ('sent','pending') ORDER BY minute ASC, id ASC LIMIT $2", [fixtureId, limit || 8]);
-  return r.rows;
+  // DESC to get MOST RECENT, then reverse for chronological presentation
+  var r = await db("SELECT minute, extra_minute, event_type, player, team, home_score, away_score FROM wp_processed_events WHERE fixture_id=$1 AND status='sent' ORDER BY minute DESC, id DESC LIMIT $2", [fixtureId, limit || 8]);
+  return r.rows.reverse();
 }
 
 function getMatchPhase(minute) {
@@ -510,7 +539,9 @@ function getCommentaryImportance(sit, minute, narrative) {
 
 async function updateMatchNarrative(fixtureId, match, scoreBefore, scoreAfter) {
   try {
-    var evR = await db("SELECT minute, extra_minute, event_type, player, team, home_score, away_score FROM wp_processed_events WHERE fixture_id=$1 AND event_type='Goal' ORDER BY minute ASC, id ASC", [fixtureId]);
+    // Only 'sent' goals — the current event is still 'pending', so including it
+    // would produce NULL score rows and corrupt equalizer/comeback detection.
+    var evR = await db("SELECT minute, extra_minute, event_type, player, team, home_score, away_score FROM wp_processed_events WHERE fixture_id=$1 AND event_type='Goal' AND status='sent' ORDER BY minute ASC, id ASC", [fixtureId]);
     var events = evR.rows;
     if (!events.length) return null;
     var openingGoalTeam = null, equalizerCount = 0, comeback = false, lateGoals = 0, biggestLead = 0, currentMomentum = null, leadChanges = 0;
@@ -710,12 +741,14 @@ async function matchScoreFromEvents(match) {
 
 // ========= MATCH SITUATION =========
 function situation(before, after, e) {
+  if (e.type === "Card") return "RED_CARD";                                             // always first — no score change for cards
   if (after.home + after.away === 1) return "OPENING_GOAL";
-  if ((before.home > before.away && after.home === after.away) || (before.away > before.home && after.home === after.away)) return "EQUALIZER";
+  if ((before.home > before.away && after.home === after.away) ||
+      (before.away > before.home && after.home === after.away)) return "EQUALIZER";
   if (before.home === before.away && after.home !== after.away) return "GO_AHEAD_GOAL";
   if (e.minute >= 75) return "LATE_GOAL";
   if (Math.abs(after.home - after.away) >= 2) return "TWO_GOAL_LEAD";
-  return e.type === "Card" ? "RED_CARD" : "GOAL";
+  return "GOAL";
 }
 
 // ========= DERBY =========
@@ -738,16 +771,21 @@ async function processEvent(match, e, row) {
   if (e.type === "Goal") {
     if (e.teamId && match.homeId && String(e.teamId) === String(match.homeId)) after.home++;
     else after.away++;
-    if (e.homeAfter !== null && e.awayAfter !== null) { after.home = e.homeAfter; after.away = e.awayAfter; }
+    if (e.homeAfter !== null && e.awayAfter !== null) {
+      if (after.home !== e.homeAfter || after.away !== e.awayAfter) {
+        console.log(`Score discrepancy on ${match.fixtureId}: reconstructed ${after.home}-${after.away} vs API ${e.homeAfter}-${e.awayAfter} — trusting API`);
+      }
+      after.home = e.homeAfter; after.away = e.awayAfter;
+    }
   }
 
   // Situation + Derby
   const sit = situation(before, after, e);
   const derbyName = await derby(match);
 
-  // Subscribers
+  // Subscribers — DISTINCT prevents double-delivery when someone follows both teams
   const r = await db(`
-    SELECT s.conversation_id FROM wp_subscribers s
+    SELECT DISTINCT s.conversation_id FROM wp_subscribers s
     JOIN wp_subscriber_teams st ON st.subscriber_id = s.conversation_id
     WHERE s.active=true AND (
       (st.team_id IS NOT NULL AND st.team_id IN ($1,$2)) OR
@@ -852,13 +890,37 @@ async function pollEvents(match) {
   if (r?.data && Array.isArray(r.data)) {
     events = r.data.map(x => goalEvent(x, match)).filter(Boolean);
   }
-  if (!events.length && FOOTBALL_API_KEY) {
+  // API-Football fallback: ONLY when fixture ID is numeric (GOAL uses CUIDs — they don't work here)
+  if (!events.length && FOOTBALL_API_KEY && /^\d+$/.test(match.fixtureId)) {
     const f = await football(`/fixtures/events?fixture=${encodeURIComponent(match.fixtureId)}`);
     if (f?.response && Array.isArray(f.response)) {
       events = f.response.map(x => footballEvent(x)).filter(Boolean);
     }
   }
   events.sort((a,b) => (a.minute + a.extra/100) - (b.minute + b.extra/100));
+
+  // Flood prevention: if this is the first poll AND the DB has no prior records for this
+  // fixture AND there are already events (match discovered mid-game or after restart),
+  // seed all existing events as 'sent' without notifying — only FUTURE events get alerts.
+  if (match._isNew && events.length > 0) {
+    const existing = await db(
+      "SELECT COUNT(*) AS n FROM wp_processed_events WHERE fixture_id=$1", [match.fixtureId]
+    );
+    if (Number(existing.rows[0]?.n || 0) === 0) {
+      console.log(`Mid-match discovery ${match.fixtureId}: seeding ${events.length} historical event(s) as sent — no notifications`);
+      for (const e of events) {
+        const key = eventKey(match.fixtureId, e);
+        await db(
+          `INSERT INTO wp_processed_events (event_key,fixture_id,minute,extra_minute,event_type,player,player_id,team,team_id,assist,status,processed_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'sent',NOW()) ON CONFLICT (event_key) DO NOTHING`,
+          [key, match.fixtureId, e.minute, e.extra, e.type, e.player||null, e.playerId||null, e.team||null, e.teamId||null, e.assist||null]
+        );
+      }
+      nextEventPoll.set(match.fixtureId, Date.now() + 45 * 1000);
+      return;
+    }
+  }
+
   for (const e of events) {
     const row = await insertNewEvent(match, e);
     if (row) {
@@ -1017,15 +1079,15 @@ button:hover{background:#30363d}
 <button onclick="fire({minute:45,type:'Goal',player:'Erling Haaland',teamHome:false})">⚽ Away Equalizer (45')</button>
 <button onclick="fire({minute:90,type:'Goal',player:'Leandro Trossard',teamHome:true,extra:3})">⚽ 90+3 Winner</button>
 <button onclick="fire({minute:55,type:'Card',player:'John Stones',teamHome:false})">🟥 Red Card (55')</button>
-<button onclick="fire({minute:22,type:'Goal',player:'Bukayo Saka',teamHome:true})">🔁 Duplicate (block)</button>
+<button onclick="fireDup()">🔁 Duplicate (block)</button>
 </div>
 </div>
 
 <div class="card">
-<h3>Full Sequence</h3>
-<p class="note" style="margin-bottom:10px">3 goals in order — opening goal, equalizer, 90+3 winner. Generates a new fixture ID automatically.</p>
+<h3>Full Sequence — waits for each delivery before firing next</h3>
+<p class="note" style="margin-bottom:10px">Opening goal → equalizer → 90+3 winner. Each event polls until delivered (sent) before the next fires.</p>
 <div class="btns">
-<button class="g" onclick="runSeq()">▶ Opening → Equalizer → 90+3 Winner</button>
+<button class="g" onclick="runSeq()">▶ Run Full Sequence</button>
 </div>
 </div>
 
@@ -1033,6 +1095,7 @@ button:hover{background:#30363d}
 <h3>Tools</h3>
 <div class="btns">
 <button onclick="newFix()">🔄 New Fixture ID</button>
+<button onclick="checkStatus()">📋 Check Delivery Status</button>
 <button class="r" onclick="reset()">🗑 Clear Fixture from DB</button>
 </div>
 </div>
@@ -1053,28 +1116,94 @@ const out=$('out');
 function lg(t,m){out.innerHTML+='<span class="'+t+'">'+m+'</span>\\n';out.scrollTop=out.scrollHeight;}
 function clr(){out.textContent='';}
 async function post(url,b){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return{s:r.status,d:await r.json().catch(()=>r.text())};}
+
+// Fire an event and return {queued, situation} or throw
 async function fire(ev){
   const s=$('sec').value,c=$('cid').value,f=$('fid').value;
-  if(!s){lg('er','✗ Set secret');return;}
-  if(!c){lg('er','✗ Set conversation ID');return;}
-  lg('in','→ '+ev.type+' '+ev.minute+"' "+(ev.player||'')+'...');
-  try{
-    const{s:st,d}=await post('/admin/test-event',{secret:s,conversationId:c,fixtureId:f,...ev});
-    if(st===200){
-      if(d.duplicate)lg('ok','✓ Duplicate blocked (correct)');
-      else lg('ok','✓ Queued ('+d.situation+') → check WhatsApp');
-    }else lg('er','✗ '+st+' '+JSON.stringify(d));
-  }catch(e){lg('er','✗ '+e.message);}
+  if(!s){lg('er','✗ Set secret');throw new Error('no secret');}
+  if(!c){lg('er','✗ Set conversation ID');throw new Error('no cid');}
+  lg('in','→ '+ev.type+' '+ev.minute+(ev.extra?'+'+ev.extra:'')+"' "+(ev.player||'')+'...');
+  const{s:st,d}=await post('/admin/test-event',{secret:s,conversationId:c,fixtureId:f,...ev});
+  if(st!==200){lg('er','✗ '+st+' '+JSON.stringify(d));throw new Error('fire failed');}
+  if(d.duplicate){lg('ok','✓ Duplicate blocked (correct)');return d;}
+  lg('ok','✓ Queued as '+d.situation+' — waiting for delivery...');
+  return d;
 }
-async function runSeq(){
-  newFix();clr();lg('in','Sequence started — fixture '+$('fid').value);
+
+// Poll /admin/test-status until the latest event for this fixture is 'sent' or 'failed'
+async function waitDelivered(fixtureId, minId, timeoutMs){
+  const deadline=Date.now()+(timeoutMs||45000);
+  while(Date.now()<deadline){
+    await new Promise(r=>setTimeout(r,2500));
+    try{
+      const res=await fetch('/admin/test-status?secret='+encodeURIComponent($('sec').value)+'&fixtureId='+encodeURIComponent(fixtureId));
+      if(!res.ok) continue;
+      const{events}=await res.json();
+      const ev=events.find(e=>e.id>=minId);
+      if(!ev) continue;
+      if(ev.status==='sent'){
+        lg('ok','  ✓ Delivered — '+ev.situation+(ev.commentary_text?' | "'+ev.commentary_text.slice(0,60)+(ev.commentary_text.length>60?'…':'')+'"':''));
+        return true;
+      }
+      if(ev.status==='failed'){lg('er','  ✗ Delivery failed');return false;}
+    }catch(e){}
+  }
+  lg('er','  ✗ Timed out waiting for delivery');return false;
+}
+
+async function fireDup(){
+  // Fire the opening goal then immediately fire the same event — second must be blocked
+  const f=$('fid').value;
   await fire({minute:22,type:'Goal',player:'Bukayo Saka',teamHome:true});
-  await new Promise(r=>setTimeout(r,1500));
-  await fire({minute:45,type:'Goal',player:'Erling Haaland',teamHome:false});
-  await new Promise(r=>setTimeout(r,1500));
-  await fire({minute:90,type:'Goal',player:'Leandro Trossard',teamHome:true,extra:3});
-  lg('in','All 3 fired — watch WhatsApp for 3 messages + voice reactions');
+  const{s:st,d}=await post('/admin/test-event',{secret:$('sec').value,conversationId:$('cid').value,fixtureId:f,minute:22,type:'Goal',player:'Bukayo Saka',teamHome:true});
+  if(st===200&&d.duplicate) lg('ok','✓ Duplicate correctly blocked');
+  else lg('er','✗ Expected duplicate block, got: '+JSON.stringify(d));
 }
+
+async function runSeq(){
+  newFix();clr();
+  const f=$('fid').value;
+  lg('in','Sequence started — fixture '+f);
+  let lastId=0;
+  try{
+    // 1. Opening goal
+    const r1=await fire({minute:22,type:'Goal',player:'Bukayo Saka',teamHome:true});
+    lastId=r1.eventId||0;
+    const ok1=await waitDelivered(f,lastId);
+    if(!ok1){lg('er','Stopping sequence — event 1 failed');return;}
+
+    // 2. Equalizer
+    const r2=await fire({minute:45,type:'Goal',player:'Erling Haaland',teamHome:false});
+    lastId=r2.eventId||lastId+1;
+    const ok2=await waitDelivered(f,lastId);
+    if(!ok2){lg('er','Stopping sequence — event 2 failed');return;}
+
+    // 3. 90+3 winner
+    const r3=await fire({minute:90,type:'Goal',player:'Leandro Trossard',teamHome:true,extra:3});
+    lastId=r3.eventId||lastId+1;
+    const ok3=await waitDelivered(f,lastId);
+
+    if(ok1&&ok2&&ok3) lg('ok','✅ All 3 events delivered — check WhatsApp + voice');
+    else lg('er','⚠ Sequence complete with errors — review above');
+  }catch(e){lg('er','Sequence error: '+e.message);}
+}
+
+async function checkStatus(){
+  const f=$('fid').value;
+  const s=$('sec').value;
+  if(!s){lg('er','✗ Set secret');return;}
+  try{
+    const res=await fetch('/admin/test-status?secret='+encodeURIComponent(s)+'&fixtureId='+encodeURIComponent(f));
+    const{events}=await res.json();
+    if(!events.length){lg('in','No events found for '+f);return;}
+    for(const e of events){
+      const icon=e.status==='sent'?'✓':e.status==='failed'?'✗':'…';
+      lg(e.status==='sent'?'ok':e.status==='failed'?'er':'in',
+        icon+' #'+e.id+' '+e.event_type+' '+e.minute+"'"+(e.player?' '+e.player:'')+' → '+e.status+(e.situation?' ['+e.situation+']':''));
+    }
+  }catch(e){lg('er','Status error: '+e.message);}
+}
+
 async function reset(){
   const{s,d}=await post('/admin/test-reset',{secret:$('sec').value,fixtureId:$('fid').value});
   lg(s===200?'ok':'er',s===200?'✓ Cleared: '+d.fixtureId:'✗ '+JSON.stringify(d));
@@ -1133,7 +1262,7 @@ async function handleTestEvent(payload) {
   const before = await matchScoreFromEvents(match);
   const after = { ...before };
   if (e.type === "Goal") { if (String(e.teamId) === String(homeId)) after.home++; else after.away++; }
-  return { queued: true, fixtureId, eventType: e.type, minute: e.minute, player: e.player, situation: situation(before, after, e) };
+  return { queued: true, fixtureId, eventId: row.id, eventType: e.type, minute: e.minute, player: e.player, situation: situation(before, after, e) };
 }
 
 async function handleTestReset(payload) {
@@ -1163,13 +1292,43 @@ const server = http.createServer((req, res) => {
   }
 
   // Test event fire + reset
+  // Test status — poll delivery state per fixture
+  if (req.method === "GET" && req.url.startsWith("/admin/test-status")) {
+    const qs = new URLSearchParams(req.url.split("?")[1] || "");
+    const testSecret = process.env.TEST_SECRET;
+    if (!testSecret || qs.get("secret") !== testSecret) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Forbidden" }));
+    }
+    const fixtureId = qs.get("fixtureId");
+    if (!fixtureId) { res.writeHead(400); return res.end(JSON.stringify({ error: "fixtureId required" })); }
+    (async () => {
+      try {
+        const evR = await db(
+          `SELECT id, event_type, minute, extra_minute, player, status, commentary_text, situation, processed_at
+           FROM wp_processed_events WHERE fixture_id=$1 ORDER BY id`, [fixtureId]
+        );
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ events: evR.rows }));
+      } catch(e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    })();
+    return;
+  }
+
   if (req.method === "POST" && (req.url === "/admin/test-event" || req.url === "/admin/test-reset")) {
     let body = "";
     req.on("data", c => body += c);
     req.on("end", async () => {
       try {
         const payload = JSON.parse(body);
-        const testSecret = process.env.TEST_SECRET || "watchparty-test";
+        const testSecret = process.env.TEST_SECRET;
+        if (!testSecret) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "TEST_SECRET not configured on server" }));
+        }
         if (!payload.secret || payload.secret !== testSecret) {
           res.writeHead(403, { "Content-Type": "application/json" });
           return res.end(JSON.stringify({ error: "Invalid secret" }));
