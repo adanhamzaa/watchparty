@@ -1012,7 +1012,7 @@ async function webhook(payload) {
   const watch = text.match(/^watch(?:party)?\s+(.+)$/i);
   if (watch) return handleWatch(conversationId, watch[1].trim());
   const n = norm(text);
-  if (n === "matches" || n === "my matches" || n === "fixtures") return showUpcoming(conversationId);
+  if (n === "match" || n === "matches" || n === "my matches" || n === "fixtures") return showUpcoming(conversationId);
   if (n === "stop" || n === "stop watchparty" || n === "stop watch") {
     await stop(conversationId);
     return sendChatwoot(conversationId, "WatchParty alerts stopped. Text WATCH ARSENAL to start again.");
