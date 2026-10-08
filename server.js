@@ -873,9 +873,22 @@ async function pollEvents(match) {
 async function poll() {
   if (polling) return;
   polling = true;
+  pollCycle++;
+  const cardSweep = (pollCycle % CARD_SWEEP_EVERY === 0); // ~every 15 min: check for red cards
   try {
-    const matches = await discoverLive();
-    for (const m of matches) { await pollEvents(m); await sleep(250); }
+    const matches = await discoverLive(); // ← the ONE GOAL API call per cycle
+    for (const m of matches) {
+      // Only call pollEvents (another GOAL request) when the score changed
+      // or it's a new match (first time seen) or it's the periodic card sweep.
+      if (m._scoreChanged || m._isNew || cardSweep) {
+        await pollEvents(m);
+        await sleep(250);
+      }
+    }
+    if (matches.length) {
+      const swept = matches.filter(m => m._scoreChanged || m._isNew || cardSweep).length;
+      console.log(`Poll #${pollCycle}: ${matches.length} live, ${swept} event-polled${cardSweep ? " (card sweep)" : ""}`);
+    }
   } catch (e) { console.log("Poll error:", e.message); }
   finally { polling = false; }
 }
