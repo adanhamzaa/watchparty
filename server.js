@@ -248,13 +248,16 @@ async function activate(conversationId) {
 
 async function follow(conversationId, team) {
   await activate(conversationId);
-  // Prevent duplicates: if team_id already followed under any name, skip insert
-  if (team.id) {
-    const existing = await db(
-      `SELECT team_name FROM wp_subscriber_teams WHERE subscriber_id=$1 AND team_id=$2`,
-      [conversationId, team.id]
-    );
-    if (existing.rows.length > 0) return; // already following this team
+  // Duplicate check: exact team_id AND name-subsumption (catches "Arsenal" vs "Arsenal FC")
+  const existing = await db(
+    `SELECT team_name, team_id FROM wp_subscriber_teams WHERE subscriber_id=$1`,
+    [conversationId]
+  );
+  for (const row of existing.rows) {
+    if (team.id && row.team_id && String(row.team_id) === String(team.id)) return;
+    const existingNorm = norm(row.team_name);
+    const newNorm = norm(team.name);
+    if (existingNorm.includes(newNorm) || newNorm.includes(existingNorm)) return;
   }
   await db(`
     INSERT INTO wp_subscriber_teams (subscriber_id, team_name, team_id)
