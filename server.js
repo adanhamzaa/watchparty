@@ -400,6 +400,25 @@ async function discoverLive() {
     if (!liveIds.has(id)) { liveMatches.delete(id); nextEventPoll.delete(id); queues.delete(id); }
   }
 
+  // Send kickoff banners for newly detected live matches
+  for (const m of live) {
+    if (!nextEventPoll.has(m.fixtureId)) {
+      try {
+        const subs = await db(
+          `SELECT DISTINCT s.conversation_id FROM wp_subscribers s
+           JOIN wp_subscriber_teams st ON st.subscriber_id = s.conversation_id
+           WHERE s.active = true AND st.team_id IN ($1, $2)`,
+          [String(m.homeId || ""), String(m.awayId || "")]
+        );
+        for (const sub of subs.rows) {
+          const svg = generateKickoffBannerSVG(m.home, m.away, m.league || "Premier League");
+          await sendSVGBanner(sub.conversation_id, svg, "kickoff.svg");
+          await sleep(500);
+        }
+      } catch(e) { console.log("Kickoff banner error:", e.message); }
+    }
+  }
+
   console.log("Live discovery:", live.length, "followed match(es) monitored");
   return live;
 }
@@ -841,6 +860,91 @@ function sendChatwoot(conversationId, content) {
   });
 }
 
+// ========= BANNER GENERATION =========
+
+function generateWelcomeBannerSVG(teamName, matchHome, matchAway, matchDate, competition) {
+  return `<svg width="400" height="220" xmlns="http://www.w3.org/2000/svg">
+    <rect width="400" height="220" fill="#1a1a2e" rx="12"/>
+    <text x="200" y="32" font-family="Arial,sans-serif" font-size="11" fill="#555555" text-anchor="middle" letter-spacing="3">WATCHPARTY</text>
+    <text x="200" y="78" font-family="Arial,sans-serif" font-size="30" fill="#ff4444" text-anchor="middle" font-weight="bold">${teamName}</text>
+    <rect x="145" y="86" width="110" height="22" rx="11" fill="#ff444422"/>
+    <text x="200" y="101" font-family="Arial,sans-serif" font-size="11" fill="#ff8888" text-anchor="middle">Now following</text>
+    <text x="200" y="128" font-family="Arial,sans-serif" font-size="11" fill="#888888" text-anchor="middle">Live alerts during every match.</text>
+    <line x1="40" y1="145" x2="360" y2="145" stroke="#ffffff22" stroke-width="1"/>
+    <text x="200" y="163" font-family="Arial,sans-serif" font-size="9" fill="#555555" text-anchor="middle" letter-spacing="2">NEXT MATCH</text>
+    <text x="200" y="181" font-family="Arial,sans-serif" font-size="13" fill="#ffffff" text-anchor="middle" font-weight="bold">${matchHome} vs ${matchAway}</text>
+    <text x="200" y="197" font-family="Arial,sans-serif" font-size="11" fill="#888888" text-anchor="middle">${matchDate}</text>
+    <text x="200" y="213" font-family="Arial,sans-serif" font-size="9" fill="#666666" text-anchor="middle">${competition}</text>
+  </svg>`;
+}
+
+function generateKickoffBannerSVG(homeTeam, awayTeam, competition) {
+  const h = homeTeam.substring(0,3).toUpperCase();
+  const a = awayTeam.substring(0,3).toUpperCase();
+  return `<svg width="400" height="200" xmlns="http://www.w3.org/2000/svg">
+    <rect width="400" height="200" fill="#0d1117" rx="12"/>
+    <rect width="400" height="40" fill="#1a472a" rx="0"/>
+    <rect width="400" height="20" fill="#1a472a" y="20"/>
+    <text x="20" y="25" font-family="Arial,sans-serif" font-size="10" fill="#ffffff66" letter-spacing="2">WATCHPARTY</text>
+    <circle cx="358" cy="20" r="6" fill="#ff3c3c"/>
+    <text x="348" y="36" font-family="Arial,sans-serif" font-size="8" fill="white" font-weight="bold">LIVE</text>
+    <circle cx="115" cy="108" r="34" fill="#ff444422" stroke="#ff444444" stroke-width="1"/>
+    <text x="115" y="114" font-family="Arial,sans-serif" font-size="14" fill="#ff6666" text-anchor="middle" font-weight="bold">${h}</text>
+    <text x="200" y="102" font-family="Arial,sans-serif" font-size="18" fill="#555555" text-anchor="middle">vs</text>
+    <circle cx="285" cy="108" r="34" fill="#ffffff11" stroke="#ffffff22" stroke-width="1"/>
+    <text x="285" y="114" font-family="Arial,sans-serif" font-size="14" fill="#dddddd" text-anchor="middle" font-weight="bold">${a}</text>
+    <text x="115" y="156" font-family="Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle">${homeTeam}</text>
+    <text x="285" y="156" font-family="Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle">${awayTeam}</text>
+    <text x="200" y="178" font-family="Arial,sans-serif" font-size="20" fill="#25D366" text-anchor="middle" font-weight="bold">KICK OFF!</text>
+    <text x="200" y="194" font-family="Arial,sans-serif" font-size="9" fill="#666666" text-anchor="middle">${competition}</text>
+  </svg>`;
+}
+
+async function sendSVGBanner(conversationId, svgString, filename) {
+  try {
+    const svgBuffer = Buffer.from(svgString, 'utf8');
+    const boundary = "WatchPartyBanner" + Date.now();
+    const header = `--${boundary}
+Content-Disposition: form-data; name="attachments[]"; filename="${filename}"
+Content-Type: image/svg+xml
+Content-Transfer-Encoding: binary
+
+`;
+    const footer = `
+--${boundary}--
+`;
+    const msgPart = `--${boundary}
+Content-Disposition: form-data; name="message_type"
+
+outgoing
+`;
+    const body = Buffer.concat([Buffer.from(msgPart), Buffer.from(header), svgBuffer, Buffer.from(footer)]);
+    return new Promise(resolve => {
+      const url = new URL(`https://${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${encodeURIComponent(conversationId)}/messages`);
+      const req = require("https").request({
+        hostname: url.hostname,
+        path: url.pathname,
+        method: "POST",
+        headers: {
+          "api_access_token": CHATWOOT_TOKEN,
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+          "Content-Length": body.length
+        }
+      }, res => {
+        let d = "";
+        res.on("data", c => d += c);
+        res.on("end", () => {
+          const ok = res.statusCode >= 200 && res.statusCode < 300;
+          if (!ok) console.log("Banner send failed:", res.statusCode, d.substring(0,200));
+          resolve(ok);
+        });
+      });
+      req.on("error", e => { console.log("Banner error:", e.message); resolve(false); });
+      req.write(body); req.end();
+    });
+  } catch(e) { console.log("Banner generation error:", e.message); return false; }
+}
+
 // ========= WHATSAPP COMMANDS =========
 async function handleWatch(conversationId, text) {
   const team = await resolveTeam(text);
@@ -848,8 +952,29 @@ async function handleWatch(conversationId, text) {
     return sendChatwoot(conversationId, `I couldn't identify "${text}".\n\nTry:\nWATCH ARSENAL\nWATCH CHELSEA\nWATCH LIVERPOOL`);
   }
   await follow(conversationId, team);
-  await sendChatwoot(conversationId, `🔴 ${team.name} selected!\n\nI'll watch their matches for you.`);
-  await showUpcoming(conversationId);
+  await sendChatwoot(conversationId, `🔴 ${team.name} selected!`);
+
+  // Send welcome banner
+  try {
+    const today = new Date().toISOString().split("T")[0];
+    const twoWeeks = new Date(Date.now() + 14*24*60*60*1000).toISOString().split("T")[0];
+    const r = await goal(`/fixtures?from=${today}&to=${twoWeeks}&leagueId=${PREMIER_LEAGUE_ID}&limit=100`);
+    let matchHome = team.name, matchAway = "TBC", matchDate = "Coming soon", competition = "Premier League";
+    if (r?.data && Array.isArray(r.data)) {
+      const next = r.data.find(m => String(m.homeTeamId) === String(team.id) || String(m.awayTeamId) === String(team.id));
+      if (next) {
+        matchHome = next.homeTeamName || team.name;
+        matchAway = next.awayTeamName || "TBC";
+        competition = next.leagueName || "Premier League";
+        matchDate = new Date(next.kickoffUtc).toLocaleString("en-KE", {
+          timeZone: "Africa/Nairobi", weekday: "short", day: "numeric",
+          month: "short", hour: "numeric", minute: "2-digit"
+        });
+      }
+    }
+    const svg = generateWelcomeBannerSVG(team.name, matchHome, matchAway, matchDate, competition);
+    await sendSVGBanner(conversationId, svg, "welcome.svg");
+  } catch(e) { console.log("Welcome banner error:", e.message); }
 }
 
 async function webhook(payload) {
