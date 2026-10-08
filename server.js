@@ -1,4 +1,4 @@
-const https = require("https"); 
+const https = require("https");
 const http = require("http");
 const { Client } = require("pg");
 
@@ -346,23 +346,6 @@ async function showUpcoming(conversationId) {
 }
 
 // ========= LIVE DISCOVERY =========
-async function liveFixturesForTeam(team) {
-  if (!team.team_id) return [];
-  // Use today's date to find matches — then check live status
-  const today = new Date().toISOString().split('T')[0];
-  const r = await goal(`/fixtures?from=${today}&to=${today}&leagueId=${PREMIER_LEAGUE_ID}&limit=100`);
-  if (!r?.data || !Array.isArray(r.data)) return [];
-  return r.data
-    .map(goalMatch)
-    .filter(Boolean)
-    .filter(m => allowedCompetition(m.league))
-    .filter(m => String(m.homeId) === String(team.team_id) || String(m.awayId) === String(team.team_id))
-    .filter(m => {
-      const s = norm(m.status);
-      return s.includes("live") || s.includes("half") || s.includes("1h") ||
-             s.includes("2h") || s === "ht" || s === "et" || s.includes("progress");
-    });
-}
 
 async function discoverLive() {
   const teams = await followedTeams();
@@ -371,23 +354,54 @@ async function discoverLive() {
     liveMatches.clear();
     return [];
   }
-  const unique = new Map();
-  for (const t of teams) {
-    const matches = await liveFixturesForTeam(t);
-    for (const m of matches) unique.set(m.fixtureId, m);
+
+  // Build set of followed team IDs
+  const followedTeamIds = new Set(
+    teams.map(t => String(t.team_id || "")).filter(Boolean)
+  );
+  if (!followedTeamIds.size) {
+    console.log("Followed teams have no GOAL IDs -> ZERO live football API polling");
+    liveMatches.clear();
+    return [];
   }
-  const matches = [...unique.values()];
-  for (const m of matches) {
+
+  // ONE GOAL request for ALL followed teams
+  const today = new Date().toISOString().split("T")[0];
+  const r = await goal(`/fixtures?from=${today}&to=${today}&leagueId=${PREMIER_LEAGUE_ID}&limit=100`);
+  if (!r?.data || !Array.isArray(r.data)) {
+    console.log("Live discovery: GOAL returned no fixtures");
+    return [];
+  }
+
+  // Convert ALL today's fixtures once
+  const allFixtures = r.data.map(goalMatch).filter(Boolean).filter(m => allowedCompetition(m.league));
+
+  // Keep only fixtures involving a followed team
+  const matches = allFixtures.filter(m =>
+    followedTeamIds.has(String(m.homeId)) || followedTeamIds.has(String(m.awayId))
+  );
+
+  // Keep only currently-live matches
+  const live = matches.filter(m => {
+    const s = norm(m.status);
+    return s.includes("live") || s.includes("half") || s.includes("1h") ||
+           s.includes("2h") || s === "ht" || s === "et" || s.includes("progress");
+  });
+
+  for (const m of live) {
     await saveMatch(m);
     liveMatches.set(m.fixtureId, m);
     if (!nextEventPoll.has(m.fixtureId)) nextEventPoll.set(m.fixtureId, 0);
   }
-  const ids = new Set(matches.map(m => m.fixtureId));
+
+  // Remove matches no longer live
+  const liveIds = new Set(live.map(m => m.fixtureId));
   for (const id of liveMatches.keys()) {
-    if (!ids.has(id)) { liveMatches.delete(id); nextEventPoll.delete(id); queues.delete(id); }
+    if (!liveIds.has(id)) { liveMatches.delete(id); nextEventPoll.delete(id); queues.delete(id); }
   }
-  console.log("Live discovery:", matches.length, "followed match(es) monitored");
-  return matches;
+
+  console.log("Live discovery:", live.length, "followed match(es) monitored");
+  return live;
 }
 
 // ========= EVENT INGESTION =========
