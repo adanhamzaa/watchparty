@@ -26,6 +26,8 @@ const WOMEN = [
 ];
 
 let polling = false;
+let pollCycle = 0;
+const CARD_SWEEP_EVERY = 5;          // every 5 cycles (~15 min) sweep all live matches for red cards
 const liveMatches = new Map();
 const queues = new Map();
 const nextEventPoll = new Map();
@@ -191,12 +193,6 @@ async function saveMatch(m) {
   `, [m.fixtureId, m.league, m.country, m.home, m.away, m.status,
       m.homeScore, m.awayScore, m.kickoffUtc ? new Date(m.kickoffUtc) : null,
       m.homeId || null, m.awayId || null]);
-}
-
-async function addVolume2Columns() {
-  await db("ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS voice_script TEXT").catch(() => {});
-  await db("ALTER TABLE wp_processed_events ADD COLUMN IF NOT EXISTS situation VARCHAR(40)").catch(() => {});
-  console.log("Volume 2 columns ready!");
 }
 
 async function addVolume2Columns() {
@@ -421,6 +417,9 @@ async function discoverLive() {
   const newLive = live.filter(m => !nextEventPoll.has(m.fixtureId));
 
   for (const m of live) {
+    const prev = liveMatches.get(m.fixtureId);
+    m._isNew = !prev;
+    m._scoreChanged = !prev || prev.homeScore !== m.homeScore || prev.awayScore !== m.awayScore;
     await saveMatch(m);
     liveMatches.set(m.fixtureId, m);
     if (!nextEventPoll.has(m.fixtureId)) nextEventPoll.set(m.fixtureId, 0);
