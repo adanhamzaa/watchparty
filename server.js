@@ -691,9 +691,11 @@ function sendVoiceChatwoot(conversationId, audioBuffer) {
 
 // ========= SCORE RECONSTRUCTION =========
 async function matchScoreFromEvents(match) {
+  // Only count 'sent' events — the current event is still 'pending',
+  // so including 'pending' would count the current goal twice in 'before'.
   const r = await db(`
     SELECT event_type, team, team_id FROM wp_processed_events
-    WHERE fixture_id=$1 AND status IN ('pending','sent') AND event_type='Goal'
+    WHERE fixture_id=$1 AND status='sent' AND event_type='Goal'
     ORDER BY minute, extra_minute, id
   `, [match.fixtureId]);
   let home = 0, away = 0;
@@ -951,6 +953,186 @@ async function webhook(payload) {
   }
 }
 
+// ========= TEST MODE =========
+
+const TEST_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WatchParty Test Console</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'SF Mono',monospace;background:#0d1117;color:#c9d1d9;padding:24px;max-width:700px}
+h1{color:#58a6ff;margin-bottom:4px;font-size:18px}
+.sub{color:#6e7681;font-size:12px;margin-bottom:20px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:16px;margin:12px 0}
+.card h3{color:#e6edf3;font-size:13px;margin-bottom:12px}
+.row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+label{color:#8b949e;font-size:12px;min-width:110px}
+input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;flex:1;border-radius:4px;font-family:monospace;font-size:13px}
+input:focus{outline:none;border-color:#58a6ff}
+.btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:8px 12px;border-radius:4px;cursor:pointer;font-size:12px}
+button:hover{background:#30363d}
+.g{background:#238636;border-color:#2ea043}
+.g:hover{background:#2ea043}
+.r{background:#6e1313;border-color:#b91c1c}
+.r:hover{background:#b91c1c}
+#out{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:12px;margin-top:12px;min-height:60px;font-size:12px;white-space:pre-wrap;max-height:260px;overflow-y:auto;line-height:1.6}
+.ok{color:#3fb950}.er{color:#f85149}.in{color:#79c0ff}
+.note{color:#e3b341;font-size:11px;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>⚽ WatchParty Test Console</h1>
+<p class="sub">Full pipeline — AI commentary + voice + WhatsApp delivery</p>
+
+<div class="card">
+<h3>Setup</h3>
+<div class="row"><label>Secret</label><input id="sec" type="password" placeholder="TEST_SECRET env var"></div>
+<div class="row"><label>Conversation ID</label><input id="cid" placeholder="Your Chatwoot conversation ID"></div>
+<div class="row"><label>Fixture ID</label><input id="fid" placeholder="auto"></div>
+<p class="note">⚠ Same Fixture ID = goals build on each other (equalizer/winner work correctly). New ID = fresh state.</p>
+</div>
+
+<div class="card">
+<h3>Single Events</h3>
+<div class="btns">
+<button onclick="fire({minute:22,type:'Goal',player:'Bukayo Saka',teamHome:true})">⚽ Opening Goal (22')</button>
+<button onclick="fire({minute:45,type:'Goal',player:'Erling Haaland',teamHome:false})">⚽ Away Equalizer (45')</button>
+<button onclick="fire({minute:90,type:'Goal',player:'Leandro Trossard',teamHome:true,extra:3})">⚽ 90+3 Winner</button>
+<button onclick="fire({minute:55,type:'Card',player:'John Stones',teamHome:false})">🟥 Red Card (55')</button>
+<button onclick="fire({minute:22,type:'Goal',player:'Bukayo Saka',teamHome:true})">🔁 Duplicate (block)</button>
+</div>
+</div>
+
+<div class="card">
+<h3>Full Sequence</h3>
+<p class="note" style="margin-bottom:10px">3 goals in order — opening goal, equalizer, 90+3 winner. Generates a new fixture ID automatically.</p>
+<div class="btns">
+<button class="g" onclick="runSeq()">▶ Opening → Equalizer → 90+3 Winner</button>
+</div>
+</div>
+
+<div class="card">
+<h3>Tools</h3>
+<div class="btns">
+<button onclick="newFix()">🔄 New Fixture ID</button>
+<button class="r" onclick="reset()">🗑 Clear Fixture from DB</button>
+</div>
+</div>
+
+<div id="out">Ready — set secret + conversation ID then fire an event.</div>
+
+<script>
+const $=id=>document.getElementById(id);
+$('sec').value=localStorage.getItem('wp_s')||'';
+$('cid').value=localStorage.getItem('wp_c')||'';
+$('fid').value=localStorage.getItem('wp_f')||newId();
+$('sec').onchange=()=>localStorage.setItem('wp_s',$('sec').value);
+$('cid').onchange=()=>localStorage.setItem('wp_c',$('cid').value);
+$('fid').onchange=()=>localStorage.setItem('wp_f',$('fid').value);
+function newId(){const v='test-'+Date.now();$('fid').value=v;localStorage.setItem('wp_f',v);return v;}
+function newFix(){newId();lg('in','New fixture: '+$('fid').value);}
+const out=$('out');
+function lg(t,m){out.innerHTML+='<span class="'+t+'">'+m+'</span>\\n';out.scrollTop=out.scrollHeight;}
+function clr(){out.textContent='';}
+async function post(url,b){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return{s:r.status,d:await r.json().catch(()=>r.text())};}
+async function fire(ev){
+  const s=$('sec').value,c=$('cid').value,f=$('fid').value;
+  if(!s){lg('er','✗ Set secret');return;}
+  if(!c){lg('er','✗ Set conversation ID');return;}
+  lg('in','→ '+ev.type+' '+ev.minute+"' "+(ev.player||'')+'...');
+  try{
+    const{s:st,d}=await post('/admin/test-event',{secret:s,conversationId:c,fixtureId:f,...ev});
+    if(st===200){
+      if(d.duplicate)lg('ok','✓ Duplicate blocked (correct)');
+      else lg('ok','✓ Queued ('+d.situation+') → check WhatsApp');
+    }else lg('er','✗ '+st+' '+JSON.stringify(d));
+  }catch(e){lg('er','✗ '+e.message);}
+}
+async function runSeq(){
+  newFix();clr();lg('in','Sequence started — fixture '+$('fid').value);
+  await fire({minute:22,type:'Goal',player:'Bukayo Saka',teamHome:true});
+  await new Promise(r=>setTimeout(r,1500));
+  await fire({minute:45,type:'Goal',player:'Erling Haaland',teamHome:false});
+  await new Promise(r=>setTimeout(r,1500));
+  await fire({minute:90,type:'Goal',player:'Leandro Trossard',teamHome:true,extra:3});
+  lg('in','All 3 fired — watch WhatsApp for 3 messages + voice reactions');
+}
+async function reset(){
+  const{s,d}=await post('/admin/test-reset',{secret:$('sec').value,fixtureId:$('fid').value});
+  lg(s===200?'ok':'er',s===200?'✓ Cleared: '+d.fixtureId:'✗ '+JSON.stringify(d));
+}
+</script>
+</body>
+</html>`;
+
+async function handleTestEvent(payload) {
+  const convId = String(payload.conversationId || "");
+  if (!convId) throw new Error("conversationId required");
+
+  // Use subscriber's real team so processEvent finds them in the subscriber lookup
+  const teamRow = await db(
+    "SELECT team_id, team_name FROM wp_subscriber_teams WHERE subscriber_id=$1 LIMIT 1",
+    [convId]
+  );
+  if (!teamRow.rows.length) throw new Error("No teams found for conversation " + convId + " — send WATCH ARSENAL first");
+  const homeName = teamRow.rows[0].team_name;
+  const homeId   = String(teamRow.rows[0].team_id || "test-home-001");
+
+  const fixtureId = String(payload.fixtureId || ("test-" + Date.now()));
+  const match = {
+    fixtureId,
+    home: homeName, away: "Man City",
+    homeId, awayId: "test-away-001",
+    league: "Premier League",
+    status: "In Progress",
+    homeScore: 0, awayScore: 0, country: "England"
+  };
+
+  const isHome = payload.teamHome !== false;
+  const e = {
+    type:    payload.type    || "Goal",
+    minute:  Number(payload.minute)  || 22,
+    extra:   Number(payload.extra)   || 0,
+    player:  payload.player  || (isHome ? "Home Player" : "Away Player"),
+    team:    isHome ? homeName : "Man City",
+    teamId:  isHome ? homeId  : "test-away-001",
+    assist: null, homeAfter: null, awayAfter: null, detail: ""
+  };
+
+  // Register as "live" so processEvent has the match in scope
+  liveMatches.set(fixtureId, match);
+  if (!nextEventPoll.has(fixtureId)) nextEventPoll.set(fixtureId, 0);
+  await saveMatch(match).catch(() => {});
+
+  // Real duplicate prevention — same event key blocks replay
+  const row = await insertNewEvent(match, e);
+  if (!row) return { duplicate: true };
+
+  // Through the real pipeline: Claude AI → ElevenLabs → WhatsApp
+  queueEvent(match, e, row);
+
+  // Approximate situation for the response (processEvent recalculates accurately)
+  const before = await matchScoreFromEvents(match);
+  const after = { ...before };
+  if (e.type === "Goal") { if (String(e.teamId) === String(homeId)) after.home++; else after.away++; }
+  return { queued: true, fixtureId, eventType: e.type, minute: e.minute, player: e.player, situation: situation(before, after, e) };
+}
+
+async function handleTestReset(payload) {
+  const fixtureId = String(payload.fixtureId || "");
+  if (!fixtureId.startsWith("test-")) throw new Error("Can only reset test fixtures (ID must start with 'test-')");
+  await db("DELETE FROM wp_processed_events WHERE fixture_id=$1", [fixtureId]);
+  await db("DELETE FROM wp_matches WHERE fixture_id=$1", [fixtureId]);
+  await db("DELETE FROM wp_match_narrative WHERE fixture_id=$1", [fixtureId]).catch(() => {});
+  liveMatches.delete(fixtureId);
+  nextEventPoll.delete(fixtureId);
+  queues.delete(fixtureId);
+  return { cleared: true, fixtureId };
+}
+
 // ========= HTTP SERVER =========
 const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -958,6 +1140,38 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ ok: true, liveMatches: liveMatches.size, polling, time: new Date().toISOString() }));
   }
   if (req.method === "GET" && req.url === "/poll-now") { res.writeHead(200); res.end("Polling started"); poll(); return; }
+
+  // Test console UI
+  if (req.method === "GET" && req.url === "/admin/test") {
+    res.writeHead(200, { "Content-Type": "text/html" });
+    return res.end(TEST_HTML);
+  }
+
+  // Test event fire + reset
+  if (req.method === "POST" && (req.url === "/admin/test-event" || req.url === "/admin/test-reset")) {
+    let body = "";
+    req.on("data", c => body += c);
+    req.on("end", async () => {
+      try {
+        const payload = JSON.parse(body);
+        const testSecret = process.env.TEST_SECRET || "watchparty-test";
+        if (!payload.secret || payload.secret !== testSecret) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Invalid secret" }));
+        }
+        const result = req.url === "/admin/test-event"
+          ? await handleTestEvent(payload)
+          : await handleTestReset(payload);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/webhook") {
     let body = "";
     req.on("data", c => body += c);
